@@ -150,6 +150,43 @@ const CAPTION_H: f32 = 17.0;
 const TAB_ROW_H: f32 = 28.0;
 pub const RIBBON_H: f32 = BODY_H + CAPTION_H + 8.0;
 
+#[derive(Clone, Default)]
+struct RibbonGroup {
+    caption: String,
+    widths: [Option<f32>; 3],
+    mode: usize,
+}
+
+fn ribbon_plan(groups: &mut [RibbonGroup], available: f32) {
+    for group in groups.iter_mut() {
+        group.mode = 0;
+    }
+    let width = |g: &RibbonGroup, mode: usize| {
+        let full = g.widths.first().copied().flatten().unwrap_or(100.0);
+        g.widths.get(mode).copied().flatten().unwrap_or(if mode == 1 { full * 0.7 } else { 80.0 }).min(full)
+    };
+    let mut total: f32 = groups.iter().map(|g| width(g, 0)).sum();
+    // Reduce one group at a time, keeping left-hand primary commands visible.
+    // Try every compact representation before folding any group into a menu.
+    for mode in 1..=2 {
+        for group in groups.iter_mut().rev() {
+            if total <= available {
+                return;
+            }
+            let next = width(group, mode);
+            let previous = width(group, group.mode);
+            if next < previous {
+                total -= previous - next;
+                group.mode = mode;
+            }
+        }
+    }
+}
+
+fn icon_only(ui: &Ui) -> bool {
+    ui.ctx().data(|data| data.get_temp::<bool>(egui::Id::new("ribbon_icon_only"))).unwrap_or(false)
+}
+
 fn icon_color(enabled: bool) -> Color32 {
     if enabled { theme::pal().ACCENT_MID } else { theme::pal().GRID_LINE_STRONG }
 }
@@ -167,6 +204,12 @@ fn hover_fill(ui: &Ui, rect: Rect, hovered: bool, active: bool) {
 
 /// Large ribbon button: icon above a label of up to two lines.
 fn big(ui: &mut Ui, icon: &str, label: &str, tip: &str, enabled: bool, active: bool) -> egui::Response {
+    if icon_only(ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("ribbon_icon_only"), false));
+        let response = big(ui, icon, "", tip, enabled, active).on_hover_text(label);
+        ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("ribbon_icon_only"), true));
+        return response;
+    }
     let font = FontId::proportional(11.5);
     let text_color = if enabled { theme::pal().TEXT } else { theme::pal().TEXT_WEAK };
     // Wrap at spaces only: as wide as the longest word, and about half the label per line.
@@ -214,6 +257,8 @@ fn big(ui: &mut Ui, icon: &str, label: &str, tip: &str, enabled: bool, active: b
 
 /// Small ribbon button: icon and label in one row (three fit under each other).
 fn small(ui: &mut Ui, icon: &str, label: &str, tip: &str, enabled: bool, active: bool) -> egui::Response {
+    let original_label = label;
+    let label = if icon_only(ui) { "" } else { label };
     let font = FontId::proportional(12.0);
     let label_w =
         if label.is_empty() { 0.0 } else { ui.painter().layout_no_wrap(label.to_string(), font.clone(), theme::pal().TEXT).size().x + 8.0 };
@@ -230,12 +275,75 @@ fn small(ui: &mut Ui, icon: &str, label: &str, tip: &str, enabled: bool, active:
             if enabled { theme::pal().TEXT } else { theme::pal().TEXT_WEAK },
         );
     }
-    let resp = if tip.is_empty() { resp } else { resp.on_hover_text(tip) };
+    let resp = if tip.is_empty() { resp.on_hover_text(original_label) } else { resp.on_hover_text(tip) };
     if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
+}
+
+/// A collapsed group is a palette, not a menu item: its combo boxes need the
+/// shared popup memory for their own lists, independently of the palette.
+fn group_popup(response: &egui::Response, add: impl FnOnce(&mut Ui)) {
+    let state_id = response.id.with("group_palette_open");
+    let mut open = response.ctx.data(|data| data.get_temp::<bool>(state_id)).unwrap_or(false);
+    if response.clicked() {
+        open = !open;
+    }
+    let behavior = if egui::Popup::is_any_open(&response.ctx) {
+        // A combo's list may extend beyond the palette. Clicking an option must
+        // not dismiss its parent before the combo can process the selection.
+        egui::PopupCloseBehavior::IgnoreClicks
+    } else {
+        egui::PopupCloseBehavior::CloseOnClickOutside
+    };
+    egui::Popup::from_response(response).open_bool(&mut open).close_behavior(behavior).show(add);
+    response.ctx.data_mut(|data| data.insert_temp(state_id, open));
 }
 
 /// A ribbon group: contents laid out left to right, the caption centered below, a divider after.
 fn group(ui: &mut Ui, caption: &str, add: impl FnOnce(&mut Ui)) {
+    let layout_id = egui::Id::new("ribbon_groups");
+    let mut groups = ui.ctx().data(|data| data.get_temp::<Vec<RibbonGroup>>(layout_id)).unwrap_or_default();
+    let index = groups.iter().position(|g| g.caption == caption).unwrap_or(groups.len());
+    if index == groups.len() {
+        groups.push(RibbonGroup { caption: caption.into(), ..Default::default() });
+    }
+    let mode = groups.get(index).map_or(0, |g| g.mode);
+    let start = ui.cursor().left();
+    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("ribbon_icon_only"), mode == 1));
+    if mode == 2 {
+        // Retain the familiar ribbon silhouette: a large icon, wrapped caption,
+        // and dropdown indicator, rather than a tall text-only button.
+        let icon = if caption == crate::tr("Clipboard") {
+            "📋"
+        } else if caption == crate::tr("Properties") {
+            "ℹ"
+        } else if caption == crate::tr("Insert") {
+            "➕"
+        } else if caption == crate::tr("Zoom") {
+            "🔍"
+        } else {
+            "☰"
+        };
+        let response = big(ui, icon, &format!("{caption} ⏷"), caption, true, false);
+        group_popup(&response, |ui| {
+            // A group can contain several controls, including combo boxes and text
+            // fields. Keep the original controls together inside the popup.
+            ui.set_max_width((ui.ctx().content_rect().width() - 32.0).max(100.0));
+            egui::ScrollArea::horizontal().id_salt("ribbon_group_scroll").show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.set_height(BODY_H);
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.spacing_mut().interact_size.y = BUTTON_H;
+                    ui.spacing_mut().button_padding.y = 2.0;
+                    add(ui);
+                });
+            });
+        });
+        if let Some(width) = groups.get_mut(index).and_then(|group| group.widths.get_mut(mode)) {
+            *width = Some(ui.cursor().left() - start);
+        }
+        ui.ctx().data_mut(|data| data.insert_temp(layout_id, groups));
+        return;
+    }
     let cap_w = ui.painter().layout_no_wrap(caption.to_string(), FontId::proportional(11.0), theme::pal().TEXT_WEAK).size().x + 12.0;
     let r = ui
         .vertical(|ui| {
@@ -271,6 +379,11 @@ fn group(ui: &mut Ui, caption: &str, add: impl FnOnce(&mut Ui)) {
     let x = ui.cursor().left();
     p.vline(x, (r.top() + 4.0)..=(r.top() + BODY_H + CAPTION_H - 4.0), Stroke::new(1.0, theme::pal().GRID_LINE_STRONG));
     ui.add_space(6.0);
+    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("ribbon_icon_only"), false));
+    if let Some(width) = groups.get_mut(index).and_then(|group| group.widths.get_mut(mode)) {
+        *width = Some(ui.cursor().left() - start);
+    }
+    ui.ctx().data_mut(|data| data.insert_temp(layout_id, groups));
 }
 
 /// Up to three small controls stacked vertically.
@@ -898,13 +1011,24 @@ pub fn command_bar(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, settings: &Ap
         ui.painter().rect_filled(body, 0.0, theme::pal().PANEL_BG);
         let mut child =
             ui.new_child(egui::UiBuilder::new().max_rect(body.shrink2(vec2(6.0, 3.0))).layout(Layout::left_to_right(Align::Min)));
+        let width_id = egui::Id::new(("ribbon_widths", st.menu_tab.label(), plancraft_core::i18n::lang().native_name()));
+        let mut groups = ui.ctx().data(|data| data.get_temp::<Vec<RibbonGroup>>(width_id)).unwrap_or_default();
+        ribbon_plan(&mut groups, body.width() - 12.0);
+        let before: Vec<_> = groups.iter().map(|g| g.widths).collect();
+        ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("ribbon_groups"), groups));
         egui::ScrollArea::horizontal()
             .id_salt("ribbon_scroll")
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .show(&mut child, |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                ui.with_layout(Layout::left_to_right(Align::Min), |ui| ribbon(ui, st, info, settings, &push));
+                ui.with_layout(Layout::left_to_right(Align::Min), |ui| ribbon(ui, st, info, settings, &push)).response.rect.width()
             });
+        let groups = ui.ctx().data(|data| data.get_temp::<Vec<RibbonGroup>>(egui::Id::new("ribbon_groups"))).unwrap_or_default();
+        let after: Vec<_> = groups.iter().map(|g| g.widths).collect();
+        ui.ctx().data_mut(|data| data.insert_temp(width_id, groups));
+        if before != after {
+            ui.ctx().request_repaint();
+        }
     }
     ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::pal().GRID_LINE_STRONG));
     out.extend(cmds.into_inner());
@@ -931,4 +1055,94 @@ fn pie(ui: &mut Ui, pct: u8, enabled: bool) -> egui::Response {
         ui.painter().add(Shape::convex_polygon(pts, color, Stroke::NONE));
     }
     resp.on_hover_text(crate::tr_dyn(&format!("Mark {pct}% complete")))
+}
+
+#[cfg(test)]
+mod responsive_tests {
+    use super::*;
+
+    #[test]
+    fn collapsed_group_allows_nested_combo_selection() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut harness = Harness::new_ui_state(
+            |ui, selected| {
+                let response = ui.button("Appearance palette");
+                group_popup(&response, |ui| {
+                    egui::ComboBox::from_label("Theme").selected_text(*selected).show_ui(ui, |ui| {
+                        ui.selectable_value(selected, "Light", "Light");
+                        ui.selectable_value(selected, "Dark", "Dark");
+                    });
+                    ui.label("Palette stays open");
+                });
+                ui.put(Rect::from_min_size(pos2(500.0, 400.0), vec2(80.0, 24.0)), egui::Button::new("Outside"));
+            },
+            "Light",
+        );
+        harness.get_by_label("Appearance palette").click();
+        harness.run();
+        harness.get_by_label("Theme").click();
+        harness.run();
+        harness.get_by_label("Dark").click();
+        harness.run();
+        assert_eq!(*harness.state(), "Dark");
+        assert!(harness.query_by_label("Palette stays open").is_some());
+        harness.get_by_label("Theme").click();
+        harness.run();
+        harness.get_by_label("Light").click();
+        harness.run();
+        assert_eq!(*harness.state(), "Light");
+        harness.get_by_label("Outside").click();
+        harness.run();
+        harness.run_steps(2);
+        assert!(harness.query_by_label("Palette stays open").is_none());
+    }
+
+    #[test]
+    fn resizing_preserves_direct_commands_before_collapsing_groups() {
+        let mut groups: Vec<_> =
+            (0..4).map(|_| RibbonGroup { widths: [Some(200.0), Some(130.0), Some(70.0)], ..Default::default() }).collect();
+        ribbon_plan(&mut groups, 790.0);
+        assert_eq!(groups.iter().filter(|g| g.mode == 1).count(), 1);
+        assert!(groups.iter().all(|g| g.mode != 2));
+        ribbon_plan(&mut groups, 500.0);
+        assert_eq!(groups.iter().filter(|g| g.mode == 2).count(), 1);
+        ribbon_plan(&mut groups, 900.0);
+        assert!(groups.iter().all(|g| g.mode == 0));
+    }
+
+    #[test]
+    fn all_tabs_settle_when_resized() {
+        let ctx = egui::Context::default();
+        let mut state = UiState::default();
+        let settings = AppSettings::default();
+        let info = MenuInfo {
+            has_doc: true,
+            title: String::new(),
+            can_undo: false,
+            can_redo: false,
+            undo_label: None,
+            task_selected: true,
+            resource_selected: true,
+            mcp_running: false,
+            mcp_url: None,
+        };
+        for tab in MenuTab::ALL {
+            state.menu_tab = tab;
+            for width in [1440.0, 1200.0, 900.0, 1440.0] {
+                for _ in 0..12 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 600.0))), ..Default::default() },
+                        |ui| {
+                            command_bar(ui, &mut state, &info, &settings, &mut Vec::new());
+                        },
+                    );
+                    output.textures_delta.clear();
+                }
+                let groups = ctx.data(|d| d.get_temp::<Vec<RibbonGroup>>(egui::Id::new("ribbon_groups"))).unwrap_or_default();
+                let mut planned = groups.clone();
+                ribbon_plan(&mut planned, width - 12.0);
+                assert_eq!(groups.iter().map(|g| g.mode).collect::<Vec<_>>(), planned.iter().map(|g| g.mode).collect::<Vec<_>>());
+            }
+        }
+    }
 }
