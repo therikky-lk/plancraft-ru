@@ -1,164 +1,153 @@
-//! Interface language: English (the default, used by tests and the MCP server) or Russian.
-//!
-//! `tr("English text")` returns the translation of a fixed string. `tr_dyn(&format!(...))`
-//! translates a formatted message: table keys may contain `{}` placeholders that match any
-//! text, and the matched parts are carried over in order into the translation.
-
+//! Embedded language catalogs and locale selection. Missing translations fall back to English.
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Interface language.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Lang {
-    #[default]
-    En,
-    Ru,
-    Ja,
+// Keep metadata and catalog registration together: the picker, persistence and lookup use this list.
+macro_rules! languages {
+    ($(($variant:ident, $code:literal, $legacy:literal, $name:literal)),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+        pub enum Lang {
+            #[default]
+            #[serde(rename = "en-US", alias = "en")]
+            En,
+            $(#[serde(rename = $code, alias = $legacy)] $variant,)+
+        }
+        impl Lang {
+            pub const ALL: &'static [Lang] = &[Self::En, $(Self::$variant,)+];
+            pub fn code(self) -> &'static str {
+                match self { Self::En => "en-US", $(Self::$variant => $code,)+ }
+            }
+            pub fn native_name(self) -> &'static str {
+                match self { Self::En => "English (United States)", $(Self::$variant => $name,)+ }
+            }
+            fn catalog_json(self) -> &'static str {
+                match self {
+                    Self::En => include_str!("locales/en-US.json"),
+                    $(Self::$variant => include_str!(concat!("locales/", $code, ".json")),)+
+                }
+            }
+        }
+    };
+}
+languages! {
+    (Ja, "ja-JP", "ja", "日本語"),
+    (ZhHans, "zh-Hans", "zh_hans", "简体中文"),
+    (ZhHant, "zh-Hant", "zh_hant", "繁體中文"),
+    (Ko, "ko-KR", "ko", "한국어"),
+    (De, "de-DE", "de", "Deutsch"),
+    (Fr, "fr-FR", "fr", "Français"),
+    (Es, "es-ES", "es", "Español"),
+    (PtBr, "pt-BR", "pt_br", "Português (Brasil)"),
+    (Ru, "ru-RU", "ru", "Русский"),
 }
 
 impl Lang {
-    pub const ALL: [Lang; 3] = [Lang::Ru, Lang::En, Lang::Ja];
-
-    /// The language's own name, for a language picker.
-    pub fn native_name(self) -> &'static str {
+    /// BCP 47 or POSIX locale. An explicit Chinese script takes precedence over region.
+    pub fn from_locale(locale: &str) -> Option<Self> {
+        let normalized = locale.split(['.', '@', ':']).next()?.replace('_', "-").to_ascii_lowercase();
+        let parts: Vec<_> = normalized.split('-').collect();
+        match parts.first().copied()? {
+            "zh" => Some(if parts.contains(&"hant") {
+                Self::ZhHant
+            } else if parts.contains(&"hans") {
+                Self::ZhHans
+            } else if parts.iter().any(|p| matches!(*p, "tw" | "hk" | "mo")) {
+                Self::ZhHant
+            } else {
+                Self::ZhHans
+            }),
+            primary => Self::ALL.iter().copied().find(|l| l.code().split('-').next().is_some_and(|s| s == primary)),
+        }
+    }
+    pub fn from_env() -> Self {
+        ["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"]
+            .iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .find(|v| !v.is_empty())
+            .and_then(|v| Self::from_locale(&v))
+            .unwrap_or_default()
+    }
+    /// Sorted English keys not yet present in this catalog, for translation maintenance.
+    pub fn missing_translation_keys(self) -> Vec<&'static str> {
+        let Some(english) = catalog(Self::En) else { return Vec::new() };
+        let mut missing: Vec<_> =
+            english.exact.keys().filter(|key| catalog(self).is_none_or(|c| !c.exact.contains_key(*key))).map(String::as_str).collect();
+        missing.sort_unstable();
+        missing
+    }
+    pub fn cjk_fonts(self) -> &'static [&'static str] {
         match self {
-            Lang::En => "English",
-            Lang::Ru => "Русский",
-            Lang::Ja => "日本語",
+            Self::Ja => &["Yu Gothic UI", "Yu Gothic", "Meiryo", "Noto Sans CJK JP", "Noto Sans JP", "MS Gothic"],
+            Self::ZhHans => &["Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC"],
+            Self::ZhHant => &["Microsoft JhengHei UI", "Microsoft JhengHei", "PingFang TC", "Noto Sans CJK TC", "Noto Sans TC"],
+            Self::Ko => &["Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR", "Noto Sans KR"],
+            _ => &[],
         }
-    }
-
-    /// Russian when the system locale (LANG / LC_ALL / LC_MESSAGES) is Russian, otherwise English.
-    pub fn from_env() -> Lang {
-        for var in ["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
-            if let Ok(v) = std::env::var(var) {
-                let v = v.to_ascii_lowercase();
-                if v.is_empty() {
-                    continue;
-                }
-                return if v.starts_with("ru") {
-                    Lang::Ru
-                } else if v.starts_with("ja") {
-                    Lang::Ja
-                } else {
-                    Lang::En
-                };
-            }
-        }
-        Lang::En
     }
 }
-
 static LANG: AtomicU8 = AtomicU8::new(0);
-
 pub fn set_lang(lang: Lang) {
-    LANG.store(
-        match lang {
-            Lang::En => 0,
-            Lang::Ru => 1,
-            Lang::Ja => 2,
-        },
-        Ordering::Relaxed,
-    );
+    let index = Lang::ALL.iter().position(|l| *l == lang).and_then(|i| u8::try_from(i).ok()).unwrap_or(0);
+    LANG.store(index, Ordering::Relaxed);
 }
-
 pub fn lang() -> Lang {
-    match LANG.load(Ordering::Relaxed) {
-        1 => Lang::Ru,
-        2 => Lang::Ja,
-        _ => Lang::En,
-    }
+    Lang::ALL.get(usize::from(LANG.load(Ordering::Relaxed))).copied().unwrap_or_default()
 }
-
 pub fn is_ru() -> bool {
     lang() == Lang::Ru
 }
-
 pub fn is_ja() -> bool {
     lang() == Lang::Ja
 }
 
-static EXACT: LazyLock<HashMap<&'static str, &'static str>> =
-    LazyLock::new(|| crate::i18n_ru::RU.iter().filter(|(k, _)| !k.contains("{}")).copied().collect());
-
-struct Template {
-    /// Literal pieces of the key around the placeholders (`parts.len() == holes + 1`).
-    parts: Vec<&'static str>,
-    out: Vec<&'static str>,
+struct Catalog {
+    exact: HashMap<String, String>,
+    templates: Vec<(String, String)>,
 }
-
-static TEMPLATES: LazyLock<Vec<Template>> = LazyLock::new(|| {
-    let mut v: Vec<Template> = crate::i18n_ru::RU
-        .iter()
-        .filter(|(k, _)| k.contains("{}"))
-        .map(|(k, t)| Template { parts: k.split("{}").collect(), out: t.split("{}").collect() })
-        .collect();
-    // Most specific (longest literal text) first.
-    v.sort_by_key(|t| std::cmp::Reverse(t.parts.iter().map(|p| p.len()).sum::<usize>()));
-    v
-});
-
-/// Translates a fixed interface string.
-pub fn tr(s: &'static str) -> &'static str {
-    if lang() == Lang::Ja {
-        return crate::i18n_ja::translate(s).unwrap_or(s);
+impl Catalog {
+    fn new(json: &str) -> Self {
+        // Bundled input only; tests validate JSON and placeholders.
+        let exact: HashMap<String, String> = serde_json::from_str(json).unwrap_or_default();
+        let mut templates: Vec<_> = exact.iter().filter(|(k, _)| k.contains("{}")).map(|(k, v)| (k.clone(), v.clone())).collect();
+        templates.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        Self { exact, templates }
     }
-    if !is_ru() {
-        return s;
-    }
-    EXACT.get(s).copied().unwrap_or(s)
-}
-
-static REVERSE: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
-    let mut m = HashMap::new();
-    for (k, v) in crate::i18n_ru::RU.iter().filter(|(k, _)| !k.contains("{}")) {
-        m.entry(*v).or_insert(*k);
-    }
-    m
-});
-
-/// The English original of a translated interface string (for choice lists whose
-/// selected text is matched in code); unknown text is returned unchanged.
-pub fn untr(s: &str) -> &str {
-    if is_ja() {
-        return crate::i18n_ja::untranslate(s);
-    }
-    REVERSE.get(s).copied().unwrap_or(s)
-}
-
-/// Translates a formatted interface message.
-pub fn tr_dyn(s: &str) -> String {
-    if lang() == Lang::Ja {
-        return crate::i18n_ja::translate_dynamic(s)
-            .or_else(|| crate::i18n_ja::translate(s).map(str::to_string))
-            .unwrap_or_else(|| s.to_string());
-    }
-    if !is_ru() {
-        return s.to_string();
-    }
-    if let Some(t) = EXACT.get(s) {
-        return (*t).to_string();
-    }
-    for t in TEMPLATES.iter() {
-        if let Some(caps) = match_template(&t.parts, s) {
-            let mut out = String::new();
-            for (i, piece) in t.out.iter().enumerate() {
-                out.push_str(piece);
-                if i + 1 < t.out.len() {
-                    // Captured parts are translated too, e.g. "Delete {}" with a view name.
-                    let cap = caps.get(i).copied().unwrap_or("");
-                    match EXACT.get(cap) {
-                        Some(c) => out.push_str(c),
-                        None => out.push_str(cap),
-                    }
-                }
-            }
-            return out;
+    fn dynamic(&self, s: &str) -> String {
+        if let Some(value) = self.exact.get(s) {
+            return value.clone();
         }
+        for (key, value) in &self.templates {
+            if let Some(caps) = match_template(&key.split("{}").collect::<Vec<_>>(), s) {
+                let mut out = String::new();
+                for (i, part) in value.split("{}").enumerate() {
+                    if i > 0 {
+                        let cap = caps.get(i.saturating_sub(1)).copied().unwrap_or("");
+                        out.push_str(self.exact.get(cap).map(String::as_str).unwrap_or(cap));
+                    }
+                    out.push_str(part);
+                }
+                return out;
+            }
+        }
+        s.to_owned()
     }
-    s.to_string()
+}
+static CATALOGS: LazyLock<HashMap<Lang, Catalog>> =
+    LazyLock::new(|| Lang::ALL.iter().map(|l| (*l, Catalog::new(l.catalog_json()))).collect());
+fn catalog(language: Lang) -> Option<&'static Catalog> {
+    CATALOGS.get(&language)
+}
+pub fn tr(s: &'static str) -> &'static str {
+    catalog(lang()).and_then(|c| c.exact.get(s)).map(String::as_str).unwrap_or(s)
+}
+pub fn untr(s: &str) -> &str {
+    catalog(lang())
+        .and_then(|c| c.exact.iter().filter(|(k, v)| !k.contains("{}") && v.as_str() == s).map(|(k, _)| k.as_str()).min())
+        .unwrap_or(s)
+}
+pub fn tr_dyn(s: &str) -> String {
+    catalog(lang()).map(|c| c.dynamic(s)).unwrap_or_else(|| s.to_owned())
 }
 
 /// Matches `s` against literal `parts` separated by wildcards; returns the wildcard captures.
@@ -214,7 +203,7 @@ pub fn weekday_short(wd: chrono::Weekday) -> &'static str {
             Sun => "Вс",
         }
     } else {
-        match wd {
+        tr(match wd {
             Mon => "Mon",
             Tue => "Tue",
             Wed => "Wed",
@@ -222,7 +211,7 @@ pub fn weekday_short(wd: chrono::Weekday) -> &'static str {
             Fri => "Fri",
             Sat => "Sat",
             Sun => "Sun",
-        }
+        })
     }
 }
 
@@ -273,7 +262,7 @@ pub fn month_short(m: u32) -> &'static str {
     } else if is_ru() {
         RU.get(i).copied().unwrap_or("")
     } else {
-        EN.get(i).copied().unwrap_or("")
+        tr(EN.get(i).copied().unwrap_or(""))
     }
 }
 
@@ -290,7 +279,7 @@ pub fn month_long(m: u32) -> &'static str {
     } else if is_ru() {
         RU.get(i).copied().unwrap_or("")
     } else {
-        EN.get(i).copied().unwrap_or("")
+        tr(EN.get(i).copied().unwrap_or(""))
     }
 }
 
@@ -343,6 +332,37 @@ pub fn parse_date(text: &str) -> Option<chrono::NaiveDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalogs_are_valid_and_preferences_remain_compatible() {
+        for &language in Lang::ALL {
+            let data: std::collections::BTreeMap<String, String> = serde_json::from_str(language.catalog_json()).unwrap();
+            assert!(!data.is_empty());
+            for (key, value) in &data {
+                assert_eq!(key.matches("{}").count(), value.matches("{}").count(), "{}: {key}", language.code());
+            }
+            assert_eq!(Lang::from_locale(language.code()), Some(language));
+            let serialized = serde_json::to_string(&language).unwrap();
+            assert_eq!(serde_json::from_str::<Lang>(&serialized).unwrap(), language);
+            let catalog = Catalog::new(language.catalog_json());
+            assert_eq!(catalog.dynamic("Unknown message 123"), "Unknown message 123");
+            assert_eq!(catalog.dynamic("Edit example"), data.get("Edit {}").unwrap().replace("{}", "example"));
+        }
+        for (code, expected) in [
+            ("zh-TW", Lang::ZhHant),
+            ("zh-HK", Lang::ZhHant),
+            ("zh-Hans-TW", Lang::ZhHans),
+            ("zh-Hant-CN", Lang::ZhHant),
+            ("de_DE.UTF-8", Lang::De),
+            ("pt-PT", Lang::PtBr),
+        ] {
+            assert_eq!(Lang::from_locale(code), Some(expected));
+        }
+        assert_eq!(Lang::from_locale("unknown"), None);
+        for (old, language) in [("en", Lang::En), ("ru", Lang::Ru), ("ja", Lang::Ja)] {
+            assert_eq!(serde_json::from_str::<Lang>(&format!("\"{old}\"")).unwrap(), language);
+        }
+    }
 
     #[test]
     fn templates_and_dates() {

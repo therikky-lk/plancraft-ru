@@ -18,7 +18,7 @@ pub struct AppSettings {
     pub mcp_autostart: bool,
     pub table_width: f32,
     pub theme: crate::theme::ThemeChoice,
-    /// Interface language (Russian by default in this edition).
+    /// Interface language, initially chosen from the system locale.
     pub language: plancraft_core::i18n::Lang,
     /// Installed font family used for interface text; empty keeps the built-in font.
     pub font_family: String,
@@ -32,10 +32,15 @@ impl Default for AppSettings {
             mcp_autostart: false,
             table_width: 720.0,
             theme: crate::theme::ThemeChoice::Light,
-            language: plancraft_core::i18n::Lang::Ru,
+            language: system_language(sys_locale::get_locale().as_deref()),
             font_family: String::new(),
         }
     }
+}
+
+/// Match a locale's language subtag, falling back to English for unsupported languages.
+fn system_language(locale: Option<&str>) -> plancraft_core::i18n::Lang {
+    locale.and_then(plancraft_core::i18n::Lang::from_locale).unwrap_or_default()
 }
 
 /// Settings files are small; a bigger one is not ours and is ignored.
@@ -50,7 +55,16 @@ impl AppSettings {
         if cfg!(test) {
             return Self::default();
         }
-        path().map(|p| Self::load_from(&p)).unwrap_or_default()
+        path()
+            .map(|p| {
+                let missing = !p.exists();
+                let settings = Self::load_from(&p);
+                if missing {
+                    let _ = settings.save_to(&p);
+                }
+                settings
+            })
+            .unwrap_or_default()
     }
 
     /// Reads settings from `path`; a missing, oversized or damaged file gives the defaults.
@@ -110,6 +124,28 @@ impl AppSettings {
 mod tests {
     use super::*;
     use crate::recovery::tests::TempDir;
+
+    #[test]
+    fn system_locale_selection_and_saved_preferences() {
+        use plancraft_core::i18n::Lang;
+        for (locale, expected) in [
+            (Some("ja-JP"), Lang::Ja),
+            (Some("RU_ru.UTF-8"), Lang::Ru),
+            (Some("en-US"), Lang::En),
+            (Some("fr-FR"), Lang::Fr),
+            (Some("jargon"), Lang::En),
+            (None, Lang::En),
+        ] {
+            assert_eq!(system_language(locale), expected);
+        }
+        let tmp = TempDir::new("settings_preferences");
+        let path = tmp.0.join("settings.json");
+        let settings = AppSettings { language: Lang::Ja, font_family: "Test Font".into(), ..AppSettings::default() };
+        settings.save_to(&path).unwrap();
+        let loaded = AppSettings::load_from(&path);
+        assert_eq!(loaded.language, Lang::Ja);
+        assert_eq!(loaded.font_family, "Test Font");
+    }
 
     #[test]
     fn settings_round_trip_privately_and_garbage_gives_defaults() {

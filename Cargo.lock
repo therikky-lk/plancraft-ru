@@ -2543,7 +2543,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plancraft-app"
-version = "0.5.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2557,13 +2557,14 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sys-locale",
  "uuid",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "plancraft-core"
-version = "0.5.0"
+version = "0.2.0"
 dependencies = [
  "calamine",
  "chrono",
@@ -2578,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "plancraft-mcp"
-version = "0.5.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "plancraft-core",
@@ -3248,6 +3249,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -4334,7 +4344,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.5.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "flate2",

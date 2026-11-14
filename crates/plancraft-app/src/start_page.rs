@@ -580,9 +580,10 @@ pub fn show(ui: &mut Ui, info: &StartInfo, font_filter: &mut String, out: &mut V
                     });
                     ui.end_row();
                     ui.label(crate::tr("Language"));
-                    ui.horizontal(|ui| {
-                        for l in plancraft_core::i18n::Lang::ALL {
-                            if ui.selectable_label(plancraft_core::i18n::lang() == l, l.native_name()).clicked() {
+                    let current = plancraft_core::i18n::lang();
+                    egui::ComboBox::from_id_salt("option_language").selected_text(current.native_name()).width(250.0).show_ui(ui, |ui| {
+                        for &l in plancraft_core::i18n::Lang::ALL {
+                            if ui.selectable_label(current == l, l.native_name()).clicked() {
                                 out.push(Command::SetLang(l));
                             }
                         }

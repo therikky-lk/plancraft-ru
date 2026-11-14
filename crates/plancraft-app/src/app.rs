@@ -1700,7 +1700,7 @@ impl PlanCraftApp {
         } else {
             egui::Panel::top("title").frame(egui::Frame::new().fill(theme::pal().BG)).show(ui, |ui| {
                 menubar::title_bar(ui, &info, &mut out);
-                menubar::command_bar(ui, &mut self.st, &info, &self.settings, &mut out);
+                menubar::command_bar(ui, &mut self.st, &info, &mut out);
                 self.doc_tabs(ui, &mut ws, &mut out);
             });
             egui::Panel::bottom("status")

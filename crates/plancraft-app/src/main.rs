@@ -88,12 +88,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     // The language must be set before any project (calendar names, currency) is created.
-    let lang = match std::env::var("PLANCRAFT_LANG").ok().as_deref() {
-        Some("en") => plancraft_core::i18n::Lang::En,
-        Some("ru") => plancraft_core::i18n::Lang::Ru,
-        Some("ja") => plancraft_core::i18n::Lang::Ja,
-        _ => settings::AppSettings::load().language,
-    };
+    let lang = std::env::var("PLANCRAFT_LANG")
+        .ok()
+        .and_then(|value| plancraft_core::i18n::Lang::from_locale(&value))
+        .unwrap_or_else(|| settings::AppSettings::load().language);
     plancraft_core::i18n::set_lang(lang);
 
     let mut ws = Workspace::default();

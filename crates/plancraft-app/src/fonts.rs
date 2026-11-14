@@ -19,35 +19,56 @@ pub fn families() -> &'static [String] {
 
 /// Install the selected system font as the first proportional and monospace face.
 pub fn install(ctx: &egui::Context, family: &str) {
+    let mut defs = ctx.fonts(|f| f.definitions().clone());
+    defs.font_data.remove("user_selected");
+    for families in defs.families.values_mut() {
+        families.retain(|name| name != "user_selected");
+    }
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
-    let fallback;
-    let family = if family.is_empty() && plancraft_core::i18n::is_ja() {
-        let found = ["Yu Gothic UI", "Yu Gothic", "Meiryo", "Noto Sans CJK JP", "Noto Sans JP", "MS Gothic"]
-            .into_iter()
-            .find(|candidate| FAMILIES.iter().any(|n| n.eq_ignore_ascii_case(candidate)));
-        let Some(found) = found else { return };
-        fallback = found;
-        fallback
-    } else if family.is_empty() {
-        return;
+    // Keep every supported CJK script available in the language picker, including
+    // when the current language or selected font uses only Latin glyphs.
+    for &language in plancraft_core::i18n::Lang::ALL {
+        let Some(family) = language.cjk_fonts().iter().find(|candidate| FAMILIES.iter().any(|n| n.eq_ignore_ascii_case(candidate))) else {
+            continue;
+        };
+        let key = format!("locale_{}", language.code());
+        if defs.font_data.contains_key(&key) {
+            continue;
+        }
+        if let Some(bytes) = font_bytes(&db, family) {
+            defs.font_data.insert(key.clone(), Arc::new(egui::FontData::from_owned(bytes)));
+            defs.families.entry(FontFamily::Proportional).or_default().push(key.clone());
+            defs.families.entry(FontFamily::Monospace).or_default().push(key);
+        }
+    }
+    let family = if family.is_empty() {
+        plancraft_core::i18n::lang()
+            .cjk_fonts()
+            .iter()
+            .find(|candidate| FAMILIES.iter().any(|n| n.eq_ignore_ascii_case(candidate)))
+            .copied()
+            .unwrap_or("")
     } else {
         family
     };
-    let Some(id) = db.query(&fontdb::Query {
+    if let Some(bytes) = font_bytes(&db, family) {
+        defs.font_data.insert("user_selected".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+        defs.families.entry(FontFamily::Proportional).or_default().insert(0, "user_selected".to_owned());
+        defs.families.entry(FontFamily::Monospace).or_default().insert(0, "user_selected".to_owned());
+    }
+    ctx.set_fonts(defs);
+}
+
+fn font_bytes(db: &fontdb::Database, family: &str) -> Option<Vec<u8>> {
+    if family.is_empty() {
+        return None;
+    }
+    let id = db.query(&fontdb::Query {
         families: &[fontdb::Family::Name(family)],
         weight: fontdb::Weight::NORMAL,
         stretch: fontdb::Stretch::Normal,
         style: fontdb::Style::Normal,
-    }) else {
-        return;
-    };
-    let Some(bytes) = db.with_face_data(id, |data, _| data.to_vec()) else {
-        return;
-    };
-    let mut defs = ctx.fonts(|f| f.definitions().clone());
-    defs.font_data.insert("user_selected".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
-    defs.families.entry(FontFamily::Proportional).or_default().insert(0, "user_selected".to_owned());
-    defs.families.entry(FontFamily::Monospace).or_default().insert(0, "user_selected".to_owned());
-    ctx.set_fonts(defs);
+    })?;
+    db.with_face_data(id, |data, _| data.to_vec())
 }

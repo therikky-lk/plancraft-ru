@@ -22,7 +22,6 @@ use plancraft_core::model::ScheduleMode;
 use crate::columns::TaskTable;
 use crate::commands::Command;
 use crate::logo;
-use crate::settings::AppSettings;
 use crate::state::{MenuTab, TaskFilter, UiState, ViewKind};
 use crate::theme;
 
@@ -514,7 +513,7 @@ fn view_button(ui: &mut Ui, st: &UiState, enabled: bool, push: &dyn Fn(Command))
     });
 }
 
-fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, settings: &AppSettings, push: &dyn Fn(Command)) {
+fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)) {
     let doc = info.has_doc;
     let sel = info.task_selected && doc;
     let res = info.resource_selected && doc;
@@ -939,29 +938,6 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, settings: &AppSettings
                     });
                 });
             });
-            group(ui, crate::tr("Appearance"), |ui| {
-                stack(ui, |ui| {
-                    labeled_combo(ui, "", crate::tr("Theme"), |ui| {
-                        egui::ComboBox::from_id_salt("tb_theme").width(130.0).selected_text(settings.theme.label()).show_ui(ui, |ui| {
-                            for t in crate::theme::ThemeChoice::ALL {
-                                if ui.selectable_label(settings.theme == t, t.label()).clicked() {
-                                    push(Command::SetTheme(t));
-                                }
-                            }
-                        });
-                    });
-                    labeled_combo(ui, "", crate::tr("Language"), |ui| {
-                        let cur = plancraft_core::i18n::lang();
-                        egui::ComboBox::from_id_salt("tb_lang").width(130.0).selected_text(cur.native_name()).show_ui(ui, |ui| {
-                            for l in plancraft_core::i18n::Lang::ALL {
-                                if ui.selectable_label(cur == l, l.native_name()).clicked() {
-                                    push(Command::SetLang(l));
-                                }
-                            }
-                        });
-                    });
-                });
-            });
         }
         MenuTab::Format => {
             let g = &mut st.gantt;
@@ -995,7 +971,7 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, settings: &AppSettings
 // ---------------------------------------------------------------------------
 
 /// Draws the tab row and the ribbon. Commands are appended to `out`.
-pub fn command_bar(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, settings: &AppSettings, out: &mut Vec<Command>) {
+pub fn command_bar(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, out: &mut Vec<Command>) {
     let avail = ui.available_rect_before_wrap();
     let body_h = if st.ribbon_collapsed { 0.0 } else { RIBBON_H };
     let rect = Rect::from_min_size(avail.min, vec2(avail.width(), TAB_ROW_H + body_h));
@@ -1021,7 +997,7 @@ pub fn command_bar(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, settings: &Ap
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .show(&mut child, |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                ui.with_layout(Layout::left_to_right(Align::Min), |ui| ribbon(ui, st, info, settings, &push)).response.rect.width()
+                ui.with_layout(Layout::left_to_right(Align::Min), |ui| ribbon(ui, st, info, &push)).response.rect.width()
             });
         let groups = ui.ctx().data(|data| data.get_temp::<Vec<RibbonGroup>>(egui::Id::new("ribbon_groups"))).unwrap_or_default();
         let after: Vec<_> = groups.iter().map(|g| g.widths).collect();
@@ -1114,7 +1090,6 @@ mod responsive_tests {
     fn all_tabs_settle_when_resized() {
         let ctx = egui::Context::default();
         let mut state = UiState::default();
-        let settings = AppSettings::default();
         let info = MenuInfo {
             has_doc: true,
             title: String::new(),
@@ -1133,7 +1108,7 @@ mod responsive_tests {
                     let mut output = ctx.run_ui(
                         egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 600.0))), ..Default::default() },
                         |ui| {
-                            command_bar(ui, &mut state, &info, &settings, &mut Vec::new());
+                            command_bar(ui, &mut state, &info, &mut Vec::new());
                         },
                     );
                     output.textures_delta.clear();

@@ -69,7 +69,11 @@ pub fn df(d: &impl AsDateTime, pat: &str) -> String {
         return if has_weekday { format!("{} {}", formatted.trim(), i18n::weekday_short(dt.weekday())) } else { formatted };
     }
     if !i18n::is_ru() {
-        return dt.format(pat).to_string();
+        let pat = pat
+            .replace("%a", i18n::weekday_short(dt.weekday()))
+            .replace("%B", i18n::month_long(dt.month()))
+            .replace("%b", i18n::month_short(dt.month()));
+        return dt.format(&pat).to_string();
     }
     // Substitute names ourselves: chrono only knows English ones.
     let pat = ru_pattern(pat)
