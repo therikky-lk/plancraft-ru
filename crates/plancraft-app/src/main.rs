@@ -20,6 +20,8 @@ mod format;
 mod logo;
 mod mcp_host;
 mod menubar;
+#[cfg(any(windows, test))]
+mod native_print;
 mod printing;
 mod recovery;
 mod settings;

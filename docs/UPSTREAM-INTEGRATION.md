@@ -30,7 +30,7 @@ Git上の共通祖先の代わりに、変更を比較する技術的な参照�
 | Multiple Baselines Gantt | `extras.rs` に番号付きベースライン・中間計画がある | 比較ビューを追加し、既存保存値を維持する |
 | Network Diagram | upstream に `network.rs` と専用ビューがある | レイアウト・操作・MCP・印刷を組み込む |
 | Task Board | upstream に boardモデル・ビュー・MCPがある | 列と状態の保存、操作、印刷を組み込む |
-| Print / Export PDF | 既存は `views/print_gantt/` のWindowsネイティブ印刷。upstreamは共通印刷モデルと自前PDF出力 | 標準印刷を保持。新プレビューのページも同じWindows印刷境界へ渡す |
+| Print / Export PDF | upstreamの共通印刷モデル・PDF出力へ統一 | 旧ガント専用プレビューを廃止。Windows印刷境界は `native_print` として共通ページの出力に利用する |
 | Split / Rejoin | 現在は `Task.resume` による未完了作業の延期。upstreamは `splits` / `gaps` を持つ | 複数分割・再結合を追加し、旧データとスケジュールを検証する |
 | Custom fields / columns | 現在の列表示に独自拡張がある。upstreamに型付きカスタム値・列定義・保存がある | 既存列と表示操作を保ち、追加定義を統合する |
 | AI assistants | 現在すでにClaude Code・Codex・GitHub Copilotの案内がある | 案内を維持し、新機能向けMCPツールを追加する |
@@ -96,7 +96,7 @@ app: 36成功、2失敗、1無視。後続のcore/MCP等の実行結果はこの
   旧 `resume` は再計算時に新しい `splits` へ変換し、Stop/Resume・作業配分・印刷を共有する。
 - 表の保存名は翻訳表示名から分離した安定キーにした。言語切り替えによって保存列が
   見えなくなることを防ぐ。既存10言語カタログ・フォント選択・通貨設定は保持した。
-- 印刷: Ctrl+Pは共通プレビュー、Ctrl+Shift+Pは従来ガントプレビュー。
+- 印刷: Ctrl+P / Ctrl+Shift+Pは共通プレビュー。従来のガント専用画面は廃止。
   Windowsではどちらも標準印刷ダイアログを使用。共通プレビューはPDFを直接保存できる。
   PDFはcoreのフォント埋め込み付き出力、標準プリンターへの出力は既存境界の300dpi画像。
 - 追加画面の文言は対応する全10言語へ接続。後続修正で英語フォールバックを翻訳し、

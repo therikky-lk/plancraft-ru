@@ -292,25 +292,7 @@ fn palette(i: u8) -> &'static Palette {
 
 /// The palette of the theme currently on screen.
 pub fn pal() -> &'static Palette {
-    if PRINTING.with(|p| p.get()) { &LIGHT } else { palette(ACTIVE.load(Ordering::Relaxed)) }
-}
-
-thread_local! {
-    static PRINTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Print on white paper without changing the application's selected theme.
-pub fn on_paper<R>(paint: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PRINTING.with(|p| p.set(self.0));
-        }
-    }
-    let restore = Restore(PRINTING.with(|p| p.replace(true)));
-    let result = paint();
-    drop(restore);
-    result
+    palette(ACTIVE.load(Ordering::Relaxed))
 }
 
 /// Whether a dark palette is on screen.

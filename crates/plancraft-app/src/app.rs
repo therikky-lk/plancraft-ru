@@ -22,7 +22,6 @@ use crate::start_page;
 use crate::state::{ToastKind, UiState, ViewKind, ViewOrder};
 use crate::theme;
 use crate::views;
-use crate::views::print_gantt::PrintSettings;
 
 #[cfg(target_os = "windows")]
 fn resize_window_edges(ctx: &egui::Context) {
@@ -83,7 +82,6 @@ pub struct PlanCraftApp {
     crash: Option<String>,
     /// Developer/test hook: panic inside the next frame (`PLANCRAFT_CMD=Panic`).
     inject_panic: bool,
-    print_settings: PrintSettings,
     /// A Save stopped because another program changed the file: asks to overwrite (by handle).
     confirm_overwrite: Option<u64>,
     /// The close (of a document or the app) to carry on with once the overwrite question is
@@ -198,7 +196,6 @@ impl PlanCraftApp {
             recovery_error: None,
             crash: None,
             inject_panic: false,
-            print_settings: PrintSettings::default(),
         };
         for path in &app.settings.recent {
             app.fonts.ensure(&cc.egui_ctx, &path.to_string_lossy());
@@ -287,7 +284,7 @@ impl PlanCraftApp {
         let map: Vec<(KeyboardShortcut, Command, bool)> = vec![
             (KeyboardShortcut::new(cmd, Key::N), Command::NewProject, true),
             (KeyboardShortcut::new(cmd, Key::O), Command::Open, true),
-            (KeyboardShortcut::new(cmd | Modifiers::SHIFT, Key::P), Command::PrintGantt, true),
+            (KeyboardShortcut::new(cmd | Modifiers::SHIFT, Key::P), Command::Print, true),
             (KeyboardShortcut::new(cmd, Key::P), Command::Print, true),
             (KeyboardShortcut::new(cmd | Modifiers::SHIFT, Key::S), Command::SaveAs, true),
             (KeyboardShortcut::new(cmd, Key::S), Command::Save, true),
@@ -616,10 +613,6 @@ impl PlanCraftApp {
                 self.set_status(crate::tr("Recovery copy discarded"));
             }
             Command::ExportCsv => self.export_csv(),
-            Command::PrintGantt => {
-                self.st.print_preview = true;
-                self.st.start_page = false;
-            }
             Command::Templates => self.dialogs.templates = true,
             Command::NewFromTemplate(t) => {
                 let start = chrono::Local::now().date_naive();
@@ -1812,11 +1805,6 @@ impl PlanCraftApp {
                         self.st.gantt.show_critical = true;
                         continue;
                     }
-                    "PrintGantt" => {
-                        self.st.print_preview = true;
-                        self.st.start_page = false;
-                        continue;
-                    }
                     "ZoomEntire" => Command::ZoomEntire,
                     "FileMenu" => {
                         egui::Popup::open_id(ctx, egui::Id::new("tab_file").with("popup"));
@@ -2186,20 +2174,7 @@ impl PlanCraftApp {
         let info = self.menu_info(&ws);
         let start_open = self.st.start_page;
 
-        if self.st.print_preview {
-            let mut close_preview = false;
-            if let Some(doc) = ws.active_doc() {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    close_preview =
-                        views::print_gantt::show(ui, &doc.project, &self.st, &mut self.print_settings, &self.settings.font_family);
-                });
-                if close_preview {
-                    self.st.print_preview = false;
-                }
-            } else {
-                self.st.print_preview = false;
-            }
-        } else if start_open {
+        if start_open {
             let stats = ws.active_doc().map(|d| plancraft_core::report::project_stats(&d.project));
             let recovered = self.rec().found.clone();
             let sinfo = start_page::StartInfo {
@@ -3025,6 +3000,26 @@ mod ui_tests {
         h.run_steps(2);
         let ws = h.state().ws.lock().unwrap();
         assert_eq!(table_fields(&ws.active_doc().unwrap().project, crate::columns::TaskTable::Entry), before);
+    }
+
+    #[test]
+    fn report_ribbon_and_both_print_shortcuts_open_the_shared_preview() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness();
+        h.state_mut().st.menu_tab = crate::state::MenuTab::Report;
+        h.state_mut().st.view = ViewKind::NetworkDiagram;
+        h.run_steps(4);
+        assert!(h.query_by_label("Print Gantt…").is_none());
+        assert!(h.query_by_label("Export PDF…").is_some());
+        h.get_by_label("Print preview and page setup").click();
+        h.run_steps(3);
+        assert!(h.state().dialogs.print.is_some());
+        assert_eq!(h.state().st.view, ViewKind::NetworkDiagram);
+        h.get_by_label("Close").click();
+        h.run_steps(3);
+        h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::P);
+        h.run_steps(3);
+        assert!(h.state().dialogs.print.is_some(), "the former Gantt shortcut now opens the shared preview");
     }
 
     #[test]

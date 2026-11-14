@@ -1,6 +1,6 @@
 //! The only unsafe printing boundary: owned Win32 printer handles and image buffers.
 #![allow(unsafe_code)]
-use super::PrintSettings;
+use plancraft_core::print::{Orientation, PageSetup, Paper};
 use windows_sys::Win32::{
     Foundation::GlobalFree,
     Graphics::Gdi::*,
@@ -35,11 +35,14 @@ impl Drop for Printer {
 
 pub(super) fn print(
     title: &str,
-    s: &PrintSettings,
+    s: &PageSetup,
     count: &dyn Fn((f32, f32)) -> anyhow::Result<usize>,
     render: &dyn Fn((f32, f32), usize) -> anyhow::Result<egui::ColorImage>,
 ) -> anyhow::Result<bool> {
-    let preview_pages = u16::try_from(count(s.mm())?)?;
+    let (w, h) = s.paper.size();
+    let (w, h) = (w * 25.4 / 72.0, h * 25.4 / 72.0);
+    let mm = if s.orientation == Orientation::Landscape { (h, w) } else { (w, h) };
+    let preview_pages = u16::try_from(count(mm)?)?;
     let mut printer = Printer {
         dialog: PRINTDLGW {
             lStructSize: std::mem::size_of::<PRINTDLGW>() as u32,
@@ -63,17 +66,14 @@ pub(super) fn print(
             let ptr = GlobalLock(printer.dialog.hDevMode).cast::<DEVMODEW>();
             if !ptr.is_null() {
                 (*ptr).dmFields |= DM_ORIENTATION | DM_PAPERSIZE;
-                (*ptr).Anonymous1.Anonymous1.dmOrientation = if s.landscape { DMORIENT_LANDSCAPE as i16 } else { DMORIENT_PORTRAIT as i16 };
-                (*ptr).Anonymous1.Anonymous1.dmPaperSize = match s.native_paper {
-                    Some(plancraft_core::print::Paper::Letter) => DMPAPER_LETTER as i16,
-                    Some(plancraft_core::print::Paper::Legal) => DMPAPER_LEGAL as i16,
-                    Some(plancraft_core::print::Paper::Tabloid) => DMPAPER_TABLOID as i16,
-                    Some(plancraft_core::print::Paper::A3) => DMPAPER_A3 as i16,
-                    Some(plancraft_core::print::Paper::A4) => DMPAPER_A4 as i16,
-                    None => match s.paper {
-                        super::Paper::A4 => DMPAPER_A4 as i16,
-                        super::Paper::A3 => DMPAPER_A3 as i16,
-                    },
+                (*ptr).Anonymous1.Anonymous1.dmOrientation =
+                    if s.orientation == Orientation::Landscape { DMORIENT_LANDSCAPE as i16 } else { DMORIENT_PORTRAIT as i16 };
+                (*ptr).Anonymous1.Anonymous1.dmPaperSize = match s.paper {
+                    Paper::Letter => DMPAPER_LETTER as i16,
+                    Paper::Legal => DMPAPER_LEGAL as i16,
+                    Paper::Tabloid => DMPAPER_TABLOID as i16,
+                    Paper::A3 => DMPAPER_A3 as i16,
+                    Paper::A4 => DMPAPER_A4 as i16,
                 };
                 GlobalUnlock(printer.dialog.hDevMode);
             }
@@ -217,17 +217,20 @@ mod tests {
         if let Some(t) = p.tasks.get_mut(1) {
             t.name = "要件定義と目標の確認".into();
         }
-        let st = super::super::UiState::default();
-        let settings = PrintSettings::default();
+        let st = crate::state::UiState::default();
+        let document = crate::printing::document(&p, &st, crate::printing::PrintView::for_view(st.view), &p.page_setup, None, None);
         let ctx = super::super::tests::context();
         let target = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target").canonicalize().unwrap();
         let path = target.join("print-proof-native.pdf");
         let ok = spool(
             &mut printer,
             &p.name,
-            &|mm| super::super::Layout::new(&p, &st, &settings, mm).map(|l| l.pages),
-            &|mm, page| {
-                let image = super::super::Layout::new(&p, &st, &settings, mm)?.render(&ctx, &p, &st, page)?;
+            &|_| Ok(document.pages.len()),
+            &|_, page| {
+                let image = super::super::render_document_page(
+                    &ctx,
+                    document.pages.get(page).ok_or_else(|| anyhow::anyhow!("Invalid print page"))?,
+                )?;
                 let bytes = image.pixels.iter().flat_map(|p| p.to_array()).collect::<Vec<_>>();
                 image::save_buffer(
                     target.join(format!("print-proof-page-{}.png", page + 1)),

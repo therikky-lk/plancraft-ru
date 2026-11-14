@@ -224,7 +224,7 @@ impl PrintDialog {
             } else {
                 #[cfg(windows)]
                 {
-                    self.status = match crate::views::print_gantt::print_document(ctx, &pages, &self.setup) {
+                    self.status = match crate::native_print::print_document(ctx, &pages, &self.setup) {
                         Ok(true) => Some((true, crate::tr("Sent to the printer.").to_string())),
                         Ok(false) => None,
                         Err(e) => Some((false, e.to_string())),

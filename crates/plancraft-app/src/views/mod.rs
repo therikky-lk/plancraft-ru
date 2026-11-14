@@ -7,7 +7,6 @@ mod gantt_cells;
 pub mod gantt_chart;
 pub mod milestones;
 pub mod network;
-pub mod print_gantt;
 pub mod resource_sheet;
 pub mod resource_usage;
 pub mod task_usage;
@@ -273,6 +272,7 @@ pub fn overallocated_tasks(p: &Project, over: &HashSet<ResourceId>) -> HashSet<T
 pub struct GroupHeader {
     #[cfg(test)]
     pub tasks: usize,
+    #[cfg(test)]
     pub label: String,
     pub start: Option<chrono::NaiveDateTime>,
     pub finish: Option<chrono::NaiveDateTime>,
@@ -283,6 +283,7 @@ pub fn group_header(p: &Project, row: &Row) -> Option<GroupHeader> {
     Some(GroupHeader {
         #[cfg(test)]
         tasks: g.tasks.len(),
+        #[cfg(test)]
         label: g.label.clone(),
         start: g.tasks.iter().filter_map(|&i| p.tasks.get(i)?.sched.start).min(),
         finish: g.tasks.iter().filter_map(|&i| p.tasks.get(i)?.sched.finish).max(),

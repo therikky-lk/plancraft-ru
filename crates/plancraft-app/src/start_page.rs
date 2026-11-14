@@ -452,8 +452,8 @@ pub fn show(ui: &mut Ui, info: &StartInfo, font_filter: &mut String, out: &mut V
         if nav_item(&mut nav_ui, crate::tr("Export"), section == Section::Export) {
             set(3);
         }
-        if nav_item(&mut nav_ui, crate::tr("Print Gantt…"), false) {
-            out.push(Command::PrintGantt);
+        if nav_item(&mut nav_ui, crate::tr("Print preview and page setup"), false) {
+            out.push(Command::Print);
             back = true;
         }
         if nav_item(&mut nav_ui, crate::tr("Close"), false) {
@@ -534,16 +534,12 @@ pub fn show(ui: &mut Ui, info: &StartInfo, font_filter: &mut String, out: &mut V
             Section::Export => {
                 ui.label(RichText::new(crate::tr("Export")).size(30.0).color(theme::pal().TEXT));
                 ui.add_space(14.0);
-                if action(ui, "print-pdf", "PDF", crate::tr("Print / PDF…"), crate::tr("Print preview and page setup")) {
+                if action(ui, "print-pdf", "PDF", crate::tr("Print preview and page setup"), crate::tr("Print / PDF…")) {
                     out.push(Command::Print);
                     back = true;
                 }
                 if action(ui, "export-pdf", "PDF", crate::tr("Export PDF…"), "") {
                     out.push(Command::ExportPdf);
-                }
-                if action(ui, "print-gantt", "PRN", crate::tr("Print Gantt…"), crate::tr("Preview and print the Gantt chart")) {
-                    out.push(Command::PrintGantt);
-                    back = true;
                 }
                 if action(ui, "xml", "📤", crate::tr("Export to MS Project XML…"), crate::tr("Microsoft Project XML")) {
                     out.push(Command::ExportMspdi);

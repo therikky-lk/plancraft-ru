@@ -236,6 +236,14 @@ fn big(ui: &mut Ui, icon: &str, label: &str, tip: &str, enabled: bool, active: b
         p.line_segment([c + vec2(-4.0, 4.0), c + vec2(4.0, 4.0)], stroke);
         p.line_segment([c + vec2(-4.0, 7.0), c + vec2(4.0, 7.0)], stroke);
         p.circle_filled(c + vec2(7.0, -2.0), 1.0, icon_color(enabled));
+    } else if icon == "pdf" {
+        let c = pos2(rect.center().x, rect.top() + 18.0);
+        let stroke = Stroke::new(1.4, icon_color(enabled));
+        let points = [c + vec2(-9.0, -12.0), c + vec2(4.0, -12.0), c + vec2(9.0, -7.0), c + vec2(9.0, 12.0), c + vec2(-9.0, 12.0)];
+        p.add(Shape::closed_line(points.to_vec(), stroke));
+        p.line_segment([c + vec2(4.0, -12.0), c + vec2(4.0, -7.0)], stroke);
+        p.line_segment([c + vec2(4.0, -7.0), c + vec2(9.0, -7.0)], stroke);
+        p.text(c + vec2(0.0, 3.0), Align2::CENTER_CENTER, "PDF", FontId::proportional(8.0), icon_color(enabled));
     } else {
         p.text(pos2(rect.center().x, rect.top() + 18.0), Align2::CENTER_CENTER, icon, FontId::proportional(24.0), icon_color(enabled));
     }
@@ -720,11 +728,8 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
                 });
             });
             group(ui, crate::tr("Export"), |ui| {
-                stack(ui, |ui| {
-                    sm(ui, "printer", crate::tr("Print / PDF…"), crate::tr("Print preview and page setup"), doc, Command::Print);
-                    sm(ui, "PDF", crate::tr("Export PDF…"), "", doc, Command::ExportPdf);
-                });
-                bg(ui, "printer", crate::tr("Print Gantt…"), crate::tr("Preview and print the Gantt chart"), doc, Command::PrintGantt);
+                bg(ui, "printer", crate::tr("Print preview and page setup"), crate::tr("Print / PDF…"), doc, Command::Print);
+                bg(ui, "pdf", crate::tr("Export PDF…"), "", doc, Command::ExportPdf);
                 bg(ui, "🗐", crate::tr("Export CSV"), crate::tr("Export the task list as CSV"), doc, Command::ExportCsv);
                 bg(ui, "📤", crate::tr("Export to MS Project XML…"), "", doc, Command::ExportMspdi);
             });
