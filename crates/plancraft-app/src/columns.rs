@@ -515,13 +515,9 @@ pub fn commit(col: TaskCol, p: &mut Project, id: TaskId, text: &str) -> Result<(
             }
             let t = task_mut(p, id)?;
             if t.mode == ScheduleMode::Manual {
-                if finish {
-                    t.manual_finish = Some(date);
-                } else {
-                    let dur = t.manual_finish.zip(t.manual_start).map(|(f, s)| f - s);
-                    t.manual_start = Some(date);
-                    t.manual_finish = dur.map(|d| date + d);
-                }
+                let start = if finish { t.manual_start } else { Some(date) };
+                let end = if finish { Some(date) } else { t.manual_finish };
+                p.set_manual_dates(id, start, end).map_err(err)?;
             } else {
                 t.constraint = Constraint { kind: if finish { ConstraintKind::Fnet } else { ConstraintKind::Snet }, date: Some(date) };
             }

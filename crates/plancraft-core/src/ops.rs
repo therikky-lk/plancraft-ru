@@ -524,6 +524,32 @@ impl Project {
             .max()
     }
 
+    /// Sets manual dates and derives duration from their working time when both are present.
+    pub fn set_manual_dates(
+        &mut self,
+        id: TaskId,
+        start: Option<chrono::NaiveDateTime>,
+        finish: Option<chrono::NaiveDateTime>,
+    ) -> PlanResult<()> {
+        let idx = self.require_task(id)?;
+        if let (Some(start), Some(finish)) = (start, finish) {
+            if finish < start {
+                return invalid("finish must not be before start");
+            }
+            let task = self.row(idx)?;
+            let cal = task.calendar.and_then(|id| self.calendar(id)).unwrap_or_else(|| self.base_calendar());
+            let minutes = crate::calendar::WorkCal::single(cal).between(start, finish);
+            if minutes > MAX_MINUTES {
+                return invalid("durations can be at most 5 years");
+            }
+            self.set_duration(id, minutes, false)?;
+        }
+        let task = self.row_mut(idx)?;
+        task.manual_start = start;
+        task.manual_finish = finish;
+        Ok(())
+    }
+
     /// Sets a task's duration, adjusting assignments according to the task type.
     pub fn set_duration(&mut self, id: TaskId, minutes: Minutes, estimated: bool) -> PlanResult<()> {
         let idx = self.require_task(id)?;

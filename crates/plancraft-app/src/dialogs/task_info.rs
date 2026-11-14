@@ -194,6 +194,7 @@ impl TaskInfo {
         let afinish = opt_date(p, &self.actual_finish, true)?;
         let manual_start = opt_date(p, &self.start, false)?;
         let manual_finish = opt_date(p, &self.finish, true)?;
+        let manual_dates_changed = p.task(id).is_some_and(|t| t.manual_start != manual_start || t.manual_finish != manual_finish);
         let estimate = match self.est_kind {
             EstKind::None => None,
             EstKind::Complexity => Some(Estimate::Complexity {
@@ -216,10 +217,6 @@ impl TaskInfo {
             let t = p.task_mut(id).ok_or(crate::tr("task was deleted"))?;
             t.constraint = Constraint { kind: self.constraint, date: if self.constraint.needs_date() { cdate } else { None } };
             t.deadline = deadline;
-            if self.mode == ScheduleMode::Manual {
-                t.manual_start = manual_start;
-                t.manual_finish = manual_finish;
-            }
             t.estimate = estimate;
         }
         if !self.summary {
@@ -232,6 +229,11 @@ impl TaskInfo {
                 if mins != cur.duration || (est || self.estimated) != cur.estimated {
                     p.set_duration(id, mins, est || self.estimated).map_err(err)?;
                 }
+            }
+        }
+        if self.mode == ScheduleMode::Manual && !self.summary {
+            if manual_dates_changed {
+                p.set_manual_dates(id, manual_start, manual_finish).map_err(err)?;
             }
         }
         // Predecessors.
