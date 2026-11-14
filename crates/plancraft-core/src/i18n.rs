@@ -334,6 +334,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upstream_screens_have_translations_in_every_locale() {
+        #[derive(serde::Deserialize)]
+        struct Coverage {
+            keys: Vec<String>,
+            same_as_english: std::collections::BTreeMap<String, Vec<String>>,
+        }
+        let coverage: Coverage = serde_json::from_str(include_str!("locales/upstream-ui-coverage.json")).unwrap();
+        for &language in Lang::ALL {
+            let data: std::collections::BTreeMap<String, String> = serde_json::from_str(language.catalog_json()).unwrap();
+            for key in &coverage.keys {
+                let value = data.get(key).unwrap_or_else(|| panic!("{}: missing {key}", language.code()));
+                assert!(!value.is_empty(), "{}: {key}", language.code());
+                if language != Lang::En && !coverage.same_as_english.get(language.code()).is_some_and(|allowed| allowed.contains(key)) {
+                    assert_ne!(value, key, "{}: untranslated {key}", language.code());
+                }
+                for token in ["[Project]", "[Manager]", "[Company]", "[View]", "[Date]", "[Page]", "[Pages]", "[Start]", "[Finish]"] {
+                    assert_eq!(key.matches(token).count(), value.matches(token).count(), "{}: {key}", language.code());
+                }
+            }
+            let catalog = Catalog::new(language.catalog_json());
+            assert_eq!(catalog.dynamic("Add custom field 'Team Delta'"), data["Add custom field '{}'"].replace("{}", "Team Delta"));
+        }
+    }
+
+    #[test]
     fn catalogs_are_valid_and_preferences_remain_compatible() {
         for &language in Lang::ALL {
             let data: std::collections::BTreeMap<String, String> = serde_json::from_str(language.catalog_json()).unwrap();

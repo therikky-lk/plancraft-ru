@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime};
 
 use super::{Document, Item, LegendPlacement, Page, PageSetup, Pt, Rect, Rgb, Stroke, TimescaleFit, font, pt};
 use crate::calendar::shift;
@@ -313,6 +313,7 @@ fn date_range(job: &PrintJob) -> (NaiveDateTime, NaiveDateTime) {
 
 /// Replaces header and footer codes.
 pub(crate) fn fill_codes(s: &str, p: &Project, view: &str, printed: NaiveDateTime, page: usize, pages: usize) -> String {
+    let s = super::template_display(s);
     let day = |d: Option<NaiveDateTime>| d.map(|d| d.format("%a %m/%d/%y").to_string()).unwrap_or_default();
     let value = |code: &str| -> Option<String> {
         Some(match code {
@@ -320,7 +321,7 @@ pub(crate) fn fill_codes(s: &str, p: &Project, view: &str, printed: NaiveDateTim
             "Manager" => p.manager.clone(),
             "Company" => p.company.clone(),
             "View" => view.to_string(),
-            "Date" => printed.format("%b %-d, %Y").to_string(),
+            "Date" => format!("{} {}, {}", crate::i18n::month_short(printed.month()), printed.day(), printed.year()),
             "Pages" => pages.to_string(),
             "Page" => page.to_string(),
             "Start" => day(p.sched.start.or(Some(p.start))),
@@ -763,11 +764,19 @@ fn legend(out: &mut Vec<Item>, job: &PrintJob, opts: &ChartOptions, r: Rect) {
     out.push(Item::Rect { rect: r, fill: None, stroke: Some(Stroke::new(0.6, pal.grid_strong)) });
     let left_w = (r.w * 0.28).min(200.0);
     let p = job.project;
-    boxed_text(out, Rect::new(r.x, r.y + 4.0, left_w, 14.0), &format!("Project: {}", p.name), TEXT, pal.text, true, Align::Left);
+    boxed_text(
+        out,
+        Rect::new(r.x, r.y + 4.0, left_w, 14.0),
+        &crate::i18n::tr_dyn(&format!("Project: {}", p.name)),
+        TEXT,
+        pal.text,
+        true,
+        Align::Left,
+    );
     boxed_text(
         out,
         Rect::new(r.x, r.y + 20.0, left_w, 14.0),
-        &format!("Date: {}", job.printed.format("%a %m/%d/%y")),
+        &crate::i18n::tr_dyn(&format!("Date: {} {}", crate::i18n::weekday_short(job.printed.weekday()), job.printed.format("%m/%d/%y"))),
         TEXT,
         pal.text,
         false,
@@ -856,7 +865,15 @@ fn legend(out: &mut Vec<Item>, job: &PrintJob, opts: &ChartOptions, r: Rect) {
     for (i, (label, draw)) in entries.iter().enumerate() {
         let (cx, cy) = at(i);
         draw(out, pt(cx, cy), pal);
-        boxed_text(out, Rect::new(cx + 26.0, cy - 7.0, (col_w - 28.0).max(0.0), 14.0), label, SMALL, pal.text, false, Align::Left);
+        boxed_text(
+            out,
+            Rect::new(cx + 26.0, cy - 7.0, (col_w - 28.0).max(0.0), 14.0),
+            &crate::i18n::tr_dyn(label),
+            SMALL,
+            pal.text,
+            false,
+            Align::Left,
+        );
     }
     for (k, (label, colour)) in series.iter().enumerate() {
         let (cx, cy) = at(entries.len() + k);

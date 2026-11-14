@@ -60,7 +60,7 @@ impl CustomFields {
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                     egui::Grid::new("custom_fields_grid").num_columns(4).spacing([10.0, 6.0]).striped(true).show(ui, |ui| {
                         for h in ["Name", "Type", "Pick-list (one per line)", ""] {
-                            ui.label(RichText::new(h).strong());
+                            ui.label(RichText::new(crate::tr(h)).strong());
                         }
                         ui.end_row();
                         for f in &fields {
@@ -133,11 +133,11 @@ impl CustomFields {
                     });
                 });
                 if let Some(e) = &self.error {
-                    ui.colored_label(theme::pal().ERROR, e);
+                    ui.colored_label(theme::pal().ERROR, crate::tr_dyn(e));
                 }
                 if let Some((label, f)) = action {
                     let adding = label.starts_with("Add ");
-                    match doc.edit_msg(&label, f) {
+                    match doc.edit_msg(&crate::tr_dyn(&label), f) {
                         Ok(()) => {
                             self.error = None;
                             // Drafts follow the plan again (names and lists as saved).

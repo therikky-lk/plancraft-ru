@@ -91,6 +91,7 @@ impl PrintDialog {
         let g = &st.gantt;
         // What the view shows that a printout follows: collapsed rows and groups, column widths.
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        plancraft_core::i18n::lang().code().hash(&mut h);
         let mut collapsed: Vec<u32> = st.collapsed.iter().map(|id| id.0).collect();
         collapsed.sort_unstable();
         collapsed.hash(&mut h);
@@ -272,7 +273,7 @@ impl PrintDialog {
             }
             if printing::HAS_PRINT_SERVICE {
                 ui.label(crate::tr("Printer"));
-                let shown = if self.printer.is_empty() { "Default printer".to_string() } else { self.printer.clone() };
+                let shown = if self.printer.is_empty() { crate::tr("Default printer").to_string() } else { self.printer.clone() };
                 egui::ComboBox::from_id_salt("print_printer").width(170.0).selected_text(shown).show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.printer, String::new(), crate::tr("Default printer"));
                     for p in &self.printers {
@@ -288,7 +289,7 @@ impl PrintDialog {
         if let Err(e) = self.range()
             && !drawing
         {
-            ui.colored_label(theme::pal().ERROR, e);
+            ui.colored_label(theme::pal().ERROR, crate::tr_dyn(&e));
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -322,7 +323,7 @@ impl PrintDialog {
             });
         }
         if let Some((ok, msg)) = &self.status {
-            ui.colored_label(if *ok { theme::pal().OK } else { theme::pal().ERROR }, msg);
+            ui.colored_label(if *ok { theme::pal().OK } else { theme::pal().ERROR }, crate::tr_dyn(msg));
         }
 
         ui.separator();
@@ -401,7 +402,10 @@ impl PrintDialog {
         for (label, texts) in [("Header", &mut s.header), ("Footer", &mut s.footer)] {
             ui.label(RichText::new(crate::tr(label)).color(weak));
             for (t, hint) in texts.iter_mut().zip(["Left", "Centre", "Right"]) {
-                ui.add(egui::TextEdit::singleline(t).hint_text(crate::tr(hint)).desired_width(f32::INFINITY));
+                let mut shown = print::template_display(t).to_string();
+                if ui.add(egui::TextEdit::singleline(&mut shown).hint_text(crate::tr(hint)).desired_width(f32::INFINITY)).changed() {
+                    *t = shown;
+                }
             }
         }
         ui.label(
@@ -428,7 +432,7 @@ impl PrintDialog {
                 self.page += 1;
             }
             if pages.truncated {
-                ui.colored_label(theme::pal().WARN, format!("Only the first {} pages print", print::layout::MAX_PAGES));
+                ui.colored_label(theme::pal().WARN, crate::tr_dyn(&format!("Only the first {} pages print", print::layout::MAX_PAGES)));
             }
         });
         let size = vec2(ui.available_width().max(200.0), (height - 40.0).max(200.0));

@@ -778,16 +778,19 @@ impl TaskInfo {
                         CustomFieldKind::Number | CustomFieldKind::Cost => "number",
                         _ => "",
                     };
-                    ui.add(egui::TextEdit::singleline(&mut row.text).hint_text(hint).desired_width(220.0));
+                    ui.add(egui::TextEdit::singleline(&mut row.text).hint_text(crate::tr(hint)).desired_width(220.0));
                 } else {
                     let shown = if row.text.is_empty() { crate::fields::NO_VALUE.to_string() } else { row.text.clone() };
-                    egui::ComboBox::from_id_salt(("ti_custom", row.field.0)).width(220.0).selected_text(shown).show_ui(ui, |ui| {
-                        for o in options {
-                            if ui.selectable_label(row.text == o, &o).clicked() {
-                                row.text = if o == crate::fields::NO_VALUE { String::new() } else { o };
+                    egui::ComboBox::from_id_salt(("ti_custom", row.field.0))
+                        .width(220.0)
+                        .selected_text(crate::fields::choice_caption(p, row.field, &shown))
+                        .show_ui(ui, |ui| {
+                            for o in options {
+                                if ui.selectable_label(row.text == o, crate::fields::choice_caption(p, row.field, &o)).clicked() {
+                                    row.text = if o == crate::fields::NO_VALUE { String::new() } else { o };
+                                }
                             }
-                        }
-                    });
+                        });
                 }
                 ui.end_row();
             }

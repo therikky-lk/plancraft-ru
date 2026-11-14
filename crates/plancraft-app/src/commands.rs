@@ -148,11 +148,11 @@ pub fn task_context_menu(ui: &mut egui::Ui, emit: &mut dyn FnMut(Command)) {
     item(ui, crate::tr("🔗  Link Tasks"), Command::LinkSelected);
     item(ui, crate::tr("⛓  Unlink Tasks"), Command::UnlinkSelected);
     ui.separator();
-    item(ui, "✔  Mark 100% Complete", Command::SetPercent(100));
-    item(ui, "📅  Add to Timeline", Command::ToggleTimeline);
-    item(ui, "⏸  Inactivate / Activate", Command::ToggleActive);
-    item(ui, "➗  Split Task", Command::SplitTask);
-    item(ui, "⟲  Rejoin Split Task", Command::RejoinTasks);
+    item(ui, crate::tr("✔  Mark 100% Complete"), Command::SetPercent(100));
+    item(ui, crate::tr("📅  Add to Timeline"), Command::ToggleTimeline);
+    item(ui, crate::tr("⏸  Inactivate / Activate"), Command::ToggleActive);
+    item(ui, &format!("➗  {}", crate::tr("Split Task")), Command::SplitTask);
+    item(ui, &format!("⟲  {}", crate::tr("Rejoin Split Task")), Command::RejoinTasks);
     ui.separator();
     item(ui, crate::tr("✂  Cut"), Command::Cut);
     item(ui, crate::tr("📋  Copy"), Command::Copy);

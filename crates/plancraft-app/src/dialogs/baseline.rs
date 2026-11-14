@@ -42,7 +42,7 @@ fn scope_row(ui: &mut Ui, selected_only: &mut bool, n: usize) {
     ui.horizontal(|ui| {
         ui.label(crate::tr("For:"));
         ui.radio_value(selected_only, false, crate::tr("Entire project"));
-        ui.add_enabled_ui(n > 0, |ui| ui.radio_value(selected_only, true, format!("Selected tasks ({n})")));
+        ui.add_enabled_ui(n > 0, |ui| ui.radio_value(selected_only, true, crate::tr_dyn(&format!("Selected tasks ({n})"))));
     });
 }
 
@@ -61,7 +61,7 @@ fn ok_cancel(ui: &mut Ui) -> (bool, bool) {
 }
 
 fn note(ui: &mut Ui, text: impl Into<String>) {
-    ui.label(RichText::new(text.into()).small().color(theme::pal().TEXT_WEAK));
+    ui.label(RichText::new(crate::tr_dyn(&text.into())).small().color(theme::pal().TEXT_WEAK));
 }
 
 pub struct SetBaseline {
@@ -117,7 +117,7 @@ impl SetBaseline {
         };
         let label = if self.interim { "Set Interim Plan" } else { "Set Baseline" };
         let n = doc.edit_msg(label, |p| p.save_baseline_plan(copy, into, &scope).map_err(|e| e.to_string()))?;
-        let tasks = if n == 1 { "1 task".to_string() } else { format!("{n} tasks") };
+        let tasks = crate::tr_dyn(&if n == 1 { "1 task".to_string() } else { format!("{n} tasks") });
         Ok(match copy {
             PlanSlot::Scheduled => format!("{} saved for {tasks}", into.name()),
             _ => format!("{} copied into {} for {tasks}", copy.name(), into.name()),
@@ -169,11 +169,14 @@ impl SetBaseline {
                     });
                 });
                 if matches!((copy, into), (PlanSlot::Interim(_), PlanSlot::Baseline(_))) {
-                    ui.colored_label(theme::pal().ERROR, "An interim plan holds only dates, so it can't be copied into a baseline.");
+                    ui.colored_label(
+                        theme::pal().ERROR,
+                        crate::tr("An interim plan holds only dates, so it can't be copied into a baseline."),
+                    );
                 } else if copy == into {
-                    ui.colored_label(theme::pal().ERROR, "Choose a different plan to copy into.");
+                    ui.colored_label(theme::pal().ERROR, crate::tr("Choose a different plan to copy into."));
                 } else if copy != PlanSlot::Scheduled && p.plan_info(copy).tasks == 0 {
-                    ui.colored_label(theme::pal().ERROR, format!("{} holds no values to copy.", copy.name()));
+                    ui.colored_label(theme::pal().ERROR, crate::tr_dyn(&format!("{} holds no values to copy.", copy.name())));
                 } else if p.plan_info(into).tasks > 0 {
                     note(ui, format!("{} already holds values; they will be replaced (Undo restores them).", into.name()));
                 }
@@ -181,7 +184,7 @@ impl SetBaseline {
                     note(ui, "Variance is measured against Baseline. Keep earlier snapshots in Baseline1–10.");
                 }
                 if let Some(e) = &self.error {
-                    ui.colored_label(theme::pal().ERROR, e);
+                    ui.colored_label(theme::pal().ERROR, crate::tr_dyn(e));
                 }
                 let (ok, cancel) = ok_cancel(ui);
                 close |= cancel;
@@ -256,7 +259,7 @@ impl ClearBaseline {
                 ui.add_space(6.0);
                 scope_row(ui, &mut self.selected_only, self.selection.len());
                 if let Some(e) = &self.error {
-                    ui.colored_label(theme::pal().ERROR, e);
+                    ui.colored_label(theme::pal().ERROR, crate::tr_dyn(e));
                 }
                 let (ok, cancel) = ok_cancel(ui);
                 close |= cancel;

@@ -520,7 +520,9 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
     let sel = info.task_selected && doc;
     let res = info.resource_selected && doc;
     let bg = |ui: &mut Ui, icon: &str, label: &str, tip: &str, enabled: bool, cmd: Command| {
-        if big(ui, icon, label, tip, enabled, false).clicked() {
+        let response = big(ui, icon, label, tip, enabled, false);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+        if response.clicked() {
             push(cmd);
         }
     };
@@ -728,6 +730,9 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
             });
         }
         MenuTab::Project => {
+            group(ui, crate::tr("Fields"), |ui| {
+                bg(ui, "#", crate::tr("Custom Fields…"), crate::tr("Define and edit custom task fields"), doc, Command::CustomFields);
+            });
             group(ui, crate::tr("Properties"), |ui| {
                 bg(
                     ui,

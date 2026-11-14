@@ -407,7 +407,13 @@ pub fn show(ui: &mut Ui, rect: Rect, doc: &mut Document, st: &mut UiState, out: 
         ui.ctx().data_mut(|dm| dm.insert_temp(egui::Id::new("task_ctx_menu"), pos));
     }
     if d.nodes.is_empty() {
-        painter.text(rect.center(), Align2::CENTER_CENTER, "No tasks to show", FontId::proportional(14.0), theme::pal().TEXT_WEAK);
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            crate::tr("No tasks to show"),
+            FontId::proportional(14.0),
+            theme::pal().TEXT_WEAK,
+        );
     }
 
     // Keys, once the diagram has been clicked: Delete, Insert, and Enter for Task Information.

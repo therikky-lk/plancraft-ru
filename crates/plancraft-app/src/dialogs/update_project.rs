@@ -116,7 +116,9 @@ impl UpdateProject {
                     ui.label(crate::tr("For:"));
                     ui.radio_value(&mut self.selected_only, false, crate::tr("Entire project"));
                     let n = self.selection.len();
-                    ui.add_enabled_ui(n > 0, |ui| ui.radio_value(&mut self.selected_only, true, format!("Selected tasks ({n})")));
+                    ui.add_enabled_ui(n > 0, |ui| {
+                        ui.radio_value(&mut self.selected_only, true, crate::tr_dyn(&format!("Selected tasks ({n})")))
+                    });
                 });
                 ui.label(
                     RichText::new(crate::tr(
@@ -126,7 +128,7 @@ impl UpdateProject {
                     .color(theme::pal().TEXT_WEAK),
                 );
                 if let Some(e) = &self.error {
-                    ui.colored_label(theme::pal().ERROR, e);
+                    ui.colored_label(theme::pal().ERROR, crate::tr_dyn(e));
                 }
                 ui.separator();
                 let row = egui::vec2(ui.available_width(), 24.0);
@@ -157,18 +159,19 @@ impl UpdateProject {
 
 /// One line saying what an update changed, e.g. "Progress updated through 2026-10-21: 3 tasks".
 fn describe(r: &TrackingReport, p: &Project, what: String) -> String {
+    let what = crate::tr_dyn(&what);
     let n = r.changed();
-    let mut msg = match n {
+    let mut msg = crate::tr_dyn(&match n {
         0 => format!("{what}: nothing needed changing"),
         1 => format!("{what}: 1 task"),
         n => format!("{what}: {n} tasks"),
-    };
+    });
     if let Some((id, why)) = r.skipped.first() {
         let name = p.task(*id).map(|t| t.name.as_str()).unwrap_or("a task");
         let more = r.skipped.len().saturating_sub(1);
-        msg += &format!(". Left '{name}' alone because {why}");
+        msg += &crate::tr_dyn(&format!(". Left '{name}' alone because {}", crate::tr_dyn(why)));
         if more > 0 {
-            msg += &format!(" (and {more} more)");
+            msg += &crate::tr_dyn(&format!(" (and {more} more)"));
         }
     }
     msg

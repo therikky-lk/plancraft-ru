@@ -319,7 +319,7 @@ pub fn column_menu_popup(ctx: &egui::Context, p: &Project, st: &UiState, out: &m
             cmd = Some(Command::GroupBy(None));
         }
         ui.separator();
-        ui.menu_button("Insert Column", |ui| {
+        ui.menu_button(crate::tr("Insert Column"), |ui| {
             use crate::columns::TaskCol;
             let hidden: Vec<Field> = fields::all_fields(p).into_iter().filter(|f| !shown.contains(f)).collect();
             let mut pick = |ui: &mut egui::Ui, f: &Field| {
@@ -335,7 +335,7 @@ pub fn column_menu_popup(ctx: &egui::Context, p: &Project, st: &UiState, out: &m
                     pick(ui, f);
                 }
                 ui.separator();
-                ui.menu_button("Baseline1–10", |ui| {
+                ui.menu_button(crate::tr("Baseline1–10"), |ui| {
                     for n in 1..=plancraft_core::baseline::MAX_BASELINE {
                         ui.menu_button(PlanSlot::Baseline(n).name(), |ui| {
                             for f in hidden.iter().filter(|f| numbered(f, n)) {
@@ -344,7 +344,7 @@ pub fn column_menu_popup(ctx: &egui::Context, p: &Project, st: &UiState, out: &m
                         });
                     }
                 });
-                ui.menu_button("Interim Plans", |ui| {
+                ui.menu_button(crate::tr("Interim Plans"), |ui| {
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                         for f in hidden.iter().filter(|f| interim(f)) {
                             pick(ui, f);
@@ -362,7 +362,7 @@ pub fn column_menu_popup(ctx: &egui::Context, p: &Project, st: &UiState, out: &m
         if ui.add_enabled(col + 1 < shown.len(), egui::Button::new(crate::tr("Move Right"))).clicked() {
             cmd = Some(Command::MoveColumn { at: col, right: true });
         }
-        if p.table_layout(st.table.label()).is_some() && ui.button(crate::tr("Reset Columns")).clicked() {
+        if p.table_layout(st.table.key()).is_some() && ui.button(crate::tr("Reset Columns")).clicked() {
             cmd = Some(Command::ResetColumns);
         }
         ui.separator();

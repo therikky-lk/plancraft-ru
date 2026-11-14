@@ -173,7 +173,7 @@ impl Field {
                 match f.kind {
                     CustomFieldKind::Text if !f.choices.is_empty() => {
                         let mut options: Vec<&str> = f.choices.iter().map(String::as_str).collect();
-                        options.push(NO_VALUE);
+                        options.push(crate::tr(NO_VALUE));
                         def.choice(&options)
                     }
                     CustomFieldKind::Text => def,
@@ -219,8 +219,8 @@ impl Field {
             Field::Builtin(c) => columns::commit(*c, p, id, text),
             Field::Custom(field) => {
                 let text = if p.custom_field(*field).is_some_and(|f| f.kind == CustomFieldKind::Flag) { crate::untr(text) } else { text };
-                let listed = p.custom_field(*field).is_some_and(|f| f.choices.iter().any(|c| c == NO_VALUE));
-                let text = if text == NO_VALUE && !listed { "" } else { text };
+                let listed = p.custom_field(*field).is_some_and(|f| f.choices.iter().any(|c| c == text));
+                let text = if (text == NO_VALUE || text == crate::tr(NO_VALUE)) && !listed { "" } else { text };
                 let value = p.parse_custom_value(*field, text).map_err(|e| e.to_string())?;
                 p.set_custom_value(id, *field, value).map_err(|e| e.to_string())
             }
@@ -302,7 +302,7 @@ impl Field {
                 columns::cell(*col, p, idx, &CellCtx { overallocated: &none }).text
             }
         };
-        if text.trim().is_empty() { "No value".to_string() } else { text }
+        if text.trim().is_empty() { crate::tr("No value").to_string() } else { text }
     }
 }
 
@@ -310,6 +310,7 @@ impl Field {
 pub fn custom_display(p: &Project, id: CustomFieldId, v: &CustomValue) -> String {
     let cost = p.custom_field(id).is_some_and(|f| f.kind == CustomFieldKind::Cost);
     match v {
+        CustomValue::Flag(value) => crate::tr(if *value { "Yes" } else { "No" }).to_string(),
         CustomValue::Number(n) if cost => format::money(p, *n),
         CustomValue::Date(d) => format::date(Some(*d)),
         other => p.custom_value_text(id, other),
@@ -362,6 +363,17 @@ pub fn all_fields(p: &Project) -> Vec<Field> {
 pub fn save_columns(p: &mut Project, table: TaskTable, fields: &[Field]) -> Result<(), String> {
     let keys: Vec<String> = fields.iter().map(Field::key).collect();
     p.set_table_columns(table.key(), &keys).map_err(|e| e.to_string())
+}
+
+/// A generated choice label is translated; saved user-defined choices keep their own text.
+pub fn choice_caption(p: &Project, id: CustomFieldId, text: &str) -> String {
+    let field = p.custom_field(id);
+    let listed = field.is_some_and(|f| f.choices.iter().any(|c| c == text));
+    if field.is_some_and(|f| f.kind == CustomFieldKind::Flag) || (text == NO_VALUE && !listed) {
+        crate::tr_dyn(text)
+    } else {
+        text.to_string()
+    }
 }
 
 #[cfg(test)]

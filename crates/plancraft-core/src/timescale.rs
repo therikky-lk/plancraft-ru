@@ -59,34 +59,39 @@ impl Unit {
             Unit::Hours6 => format!("{:02}", t.hour()),
             Unit::Day => {
                 if width >= 90.0 {
-                    d.format("%a %b %-d").to_string()
+                    format!("{} {} {}", crate::i18n::weekday_short(d.weekday()), crate::i18n::month_short(d.month()), d.day())
                 } else if width >= 26.0 {
                     d.format("%-d").to_string()
                 } else {
-                    first(d.format("%a").to_string())
+                    crate::i18n::weekday_letter(d.weekday()).to_string()
                 }
             }
             Unit::Week => {
                 if width >= 110.0 {
-                    format!("Week of {}", d.format("%b %-d, '%y"))
+                    let date = format!("{} {}, {}", crate::i18n::month_short(d.month()), d.day(), d.year());
+                    crate::i18n::tr_dyn(&format!("Week of {date}"))
                 } else if width >= 60.0 {
-                    d.format("%b %-d, '%y").to_string()
+                    format!("{} {}, {}", crate::i18n::month_short(d.month()), d.day(), d.year())
                 } else {
                     d.format("%-d").to_string()
                 }
             }
             Unit::Month => {
                 if width >= 90.0 {
-                    d.format("%B %Y").to_string()
+                    format!("{} {}", crate::i18n::month_long(d.month()), d.year())
                 } else if width >= 40.0 {
-                    d.format("%b '%y").to_string()
+                    format!("{} {}", crate::i18n::month_short(d.month()), d.year())
                 } else {
-                    first(d.format("%b").to_string())
+                    first(crate::i18n::month_short(d.month()).to_string())
                 }
             }
             Unit::Quarter => {
                 let q = d.month0() / 3 + 1;
-                if width >= 60.0 { format!("Q{q} {}", d.year()) } else { format!("Q{q}") }
+                if width >= 60.0 {
+                    format!("{} {}", crate::i18n::tr_dyn(&format!("Q{q}")), d.year())
+                } else {
+                    crate::i18n::tr_dyn(&format!("Q{q}"))
+                }
             }
             Unit::Year => d.year().to_string(),
         }

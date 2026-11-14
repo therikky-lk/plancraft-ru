@@ -96,11 +96,11 @@ impl BlField {
 
     pub fn label(self) -> &'static str {
         match self {
-            BlField::Start => "Start",
-            BlField::Finish => "Finish",
-            BlField::Duration => "Duration",
-            BlField::Work => "Work",
-            BlField::Cost => "Cost",
+            BlField::Start => crate::tr("Start"),
+            BlField::Finish => crate::tr("Finish"),
+            BlField::Duration => crate::tr("Duration"),
+            BlField::Work => crate::tr("Work"),
+            BlField::Cost => crate::tr("Cost"),
         }
     }
 
@@ -327,7 +327,9 @@ impl TaskCol {
                     _ => ColumnDef::new(title, 96.0).right().read_only(),
                 }
             }
-            Interim(n, finish) => ColumnDef::new(format!("{}{n}", if finish { "Finish" } else { "Start" }), 96.0).read_only(),
+            Interim(n, finish) => {
+                ColumnDef::new(crate::tr_dyn(&format!("{}{n}", if finish { "Finish" } else { "Start" })), 96.0).read_only()
+            }
             ActualDuration => ColumnDef::new(crate::tr("Act. Dur."), 76.0).right(),
             RemainingDuration => ColumnDef::new(crate::tr("Rem. Dur."), 76.0).right(),
             Stop => ColumnDef::new(crate::tr("Stop"), 100.0).read_only(),
@@ -560,11 +562,11 @@ pub fn cell(col: TaskCol, p: &Project, idx: usize, ctx: &CellCtx) -> Cell {
             None => Cell::default(),
         },
         OutlineNumber => Cell::weak(outline_number(p, idx)),
-        Recurring => Cell::text(if p.is_recurring(idx) { "Yes" } else { "No" }),
+        Recurring => Cell::text(crate::tr(if p.is_recurring(idx) { "Yes" } else { "No" })),
         // Summary tasks have no card; their subtasks do.
         BoardStatus if summary => Cell::default(),
         BoardStatus => Cell::text(p.board_column_of(idx).and_then(|c| p.board_column(c)).map(|c| c.name.clone()).unwrap_or_default()),
-        ShowOnBoard => Cell::text(if t.show_on_board { "Yes" } else { "No" }),
+        ShowOnBoard => Cell::text(crate::tr(if t.show_on_board { "Yes" } else { "No" })),
     };
     if summary && col != Name && col != Indicators {
         c.bold = true;

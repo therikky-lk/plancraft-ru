@@ -2423,6 +2423,34 @@ mod ui_tests {
         h
     }
 
+    #[test]
+    fn project_ribbon_opens_custom_fields_and_adds_an_undoable_field() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut ws = Workspace::default();
+        ws.add(Project::new("Custom fields", NaiveDate::from_ymd_opt(2026, 10, 19).unwrap()), None);
+        let shared = ws.shared();
+        let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).build_eframe(move |cc| PlanCraftApp::new(cc, shared));
+        h.state_mut().st.menu_tab = crate::state::MenuTab::Project;
+        h.run_steps(3);
+        h.get_by_label("Custom Fields…").click();
+        h.run_steps(3);
+        assert!(h.state().dialogs.custom_fields.is_some());
+        let name = h.query_all_by_role(Role::TextInput).next().unwrap();
+        name.focus();
+        name.type_text("Team Delta");
+        h.run_steps(2);
+        h.get_by_label("Add Field").click();
+        h.run_steps(3);
+        let ws = h.state().ws.lock().unwrap();
+        assert!(ws.active_doc().unwrap().project.custom_fields.iter().any(|f| f.name == "Team Delta"));
+        drop(ws);
+        let ctx = h.ctx.clone();
+        h.state_mut().exec(&ctx, Command::Undo);
+        h.run_steps(2);
+        assert!(!h.state().ws.lock().unwrap().active_doc().unwrap().project.custom_fields.iter().any(|f| f.name == "Team Delta"));
+    }
+
     fn focus_task_grid(h: &mut Harness<'static, PlanCraftApp>) {
         let id = egui::Id::new(("task_grid", "Entry")).with("body");
         h.ctx.memory_mut(|m| m.request_focus(id));

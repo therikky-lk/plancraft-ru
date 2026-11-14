@@ -204,7 +204,7 @@ pub fn show(ui: &mut Ui, rect: Rect, doc: &mut Document, st: &mut UiState, out: 
         painter.text(
             body.center(),
             Align2::CENTER_CENTER,
-            "No tasks on the board. New tasks start in the first column.",
+            crate::tr("No tasks on the board. New tasks start in the first column."),
             FontId::proportional(14.0),
             theme::pal().TEXT_WEAK,
         );
@@ -448,7 +448,7 @@ fn column_window(ctx: &egui::Context, doc: &mut Document, st: &mut UiState) {
     let mut close = false;
     let mut apply = false;
     let title = if edit.id.is_some() { "Board Column" } else { "Add Board Column" };
-    egui::Window::new(title)
+    egui::Window::new(crate::tr(title))
         .id(egui::Id::new("board_column"))
         .pivot(Align2::CENTER_TOP)
         .default_pos(ctx.content_rect().center_top() + vec2(0.0, 160.0))
@@ -470,7 +470,7 @@ fn column_window(ctx: &egui::Context, doc: &mut Document, st: &mut UiState) {
                     .color(theme::pal().TEXT_WEAK),
             );
             if let Some(e) = &edit.error {
-                ui.colored_label(theme::pal().ERROR, e);
+                ui.colored_label(theme::pal().ERROR, crate::tr_dyn(e));
             }
             ui.separator();
             ui.horizontal(|ui| {

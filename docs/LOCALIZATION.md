@@ -51,12 +51,18 @@ MCP tool names and document operations remain independent of catalog files.
 
 ## Upstream v0.4.1 integration
 
-The integration adds Japanese UI copy for the new views and print controls.
-Existing translations in the other locales remain intact; newly added keys
-without a translation currently contain their English fallback. Equal key
-counts and passing placeholder checks do not mean those new entries have been
-translated. Review and translate those English entries before describing the
-new features as fully localized in every supported language.
+The new views, baseline and recurrence dialogs, custom fields, column menus,
+print preview, AI assistant connection instructions and PDF controls now have
+translations in all ten supported locales. This includes generated page footers, date labels and validation
+messages. Non-English translations are drafts and still benefit from native
+speaker review. Technical paper sizes, template tokens and words shared by
+languages may intentionally match English.
+
+The upstream UI coverage fixture checks 298 entries for missing translations,
+English fallbacks (with explicit per-locale exceptions), formatting placeholders
+and print tokens. It also checks that a user-supplied field name survives
+message formatting. The Project ribbon exposes the custom-field editor, with an
+interaction test covering opening it, adding a field and Undo.
 
 Saved task-table layout names use stable English keys independently of the
 translated table caption, so changing the interface language keeps the same

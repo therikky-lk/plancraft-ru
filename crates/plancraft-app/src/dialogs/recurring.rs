@@ -13,8 +13,6 @@ use crate::state::{ToastKind, UiState};
 use crate::theme;
 
 const WEEKDAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-const MONTHS: [&str; 12] =
-    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -214,9 +212,9 @@ impl RecurringTask {
                     }
                 });
                 let wd = WEEKDAYS.get(usize::from(self.weekday)).copied().unwrap_or_default();
-                egui::ComboBox::from_id_salt("rt_weekday").width(96.0).selected_text(wd).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("rt_weekday").width(96.0).selected_text(crate::tr(wd)).show_ui(ui, |ui| {
                     for (k, name) in WEEKDAYS.iter().enumerate() {
-                        ui.selectable_value(&mut self.weekday, k as u8, *name);
+                        ui.selectable_value(&mut self.weekday, k as u8, crate::tr(name));
                     }
                 });
                 if every {
@@ -249,7 +247,7 @@ impl RecurringTask {
                 ui.label(RichText::new(crate::tr("Recurrence pattern")).strong());
                 ui.horizontal(|ui| {
                     for (k, label) in [(Kind::Daily, "Daily"), (Kind::Weekly, "Weekly"), (Kind::Monthly, "Monthly"), (Kind::Yearly, "Yearly")] {
-                        ui.radio_value(&mut self.kind, k, label);
+                        ui.radio_value(&mut self.kind, k, crate::tr(label));
                     }
                 });
                 ui.indent("rt_pattern", |ui| match self.kind {
@@ -270,7 +268,7 @@ impl RecurringTask {
                         ui.horizontal(|ui| {
                             for (k, name) in WEEKDAYS.iter().enumerate() {
                                 if let Some(on) = self.days.get_mut(k) {
-                                    ui.checkbox(on, name.get(..3).unwrap_or(name));
+                                    ui.checkbox(on, crate::tr(name.get(..3).unwrap_or(name)));
                                 }
                             }
                         });
@@ -280,10 +278,10 @@ impl RecurringTask {
                         self.on_day(ui, false);
                         ui.horizontal(|ui| {
                             ui.label(crate::tr("of"));
-                            let m = MONTHS.get(usize::from(self.month).saturating_sub(1)).copied().unwrap_or_default();
+                            let m = plancraft_core::i18n::month_long(u32::from(self.month));
                             egui::ComboBox::from_id_salt("rt_month").width(110.0).selected_text(m).show_ui(ui, |ui| {
-                                for (k, name) in MONTHS.iter().enumerate() {
-                                    ui.selectable_value(&mut self.month, k as u8 + 1, *name);
+                                for month in 1..=12_u8 {
+                                    ui.selectable_value(&mut self.month, month, plancraft_core::i18n::month_long(u32::from(month)));
                                 }
                             });
                         });
@@ -309,7 +307,7 @@ impl RecurringTask {
                 ui.horizontal(|ui| {
                     ui.label(crate::tr("Calendar:"));
                     let p = &doc.project;
-                    let name = self.calendar.and_then(|c| p.calendar(c)).map_or("None (project calendar)".to_string(), |c| c.name.clone());
+                    let name = self.calendar.and_then(|c| p.calendar(c)).map_or(crate::tr("None (project calendar)").to_string(), |c| c.name.clone());
                     egui::ComboBox::from_id_salt("rt_cal").width(170.0).selected_text(name).show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.calendar, None, crate::tr("None (project calendar)"));
                         for c in &p.calendars {
@@ -319,8 +317,8 @@ impl RecurringTask {
                 });
                 ui.checkbox(&mut self.ignore_resource_calendars, crate::tr("Scheduling ignores resource calendars"));
                 match self.preview(&doc.project) {
-                    Ok(text) => ui.label(RichText::new(text).small().color(theme::pal().TEXT_WEAK)),
-                    Err(e) => ui.colored_label(theme::pal().ERROR, e),
+                    Ok(text) => ui.label(RichText::new(crate::tr_dyn(&text)).small().color(theme::pal().TEXT_WEAK)),
+                    Err(e) => ui.colored_label(theme::pal().ERROR, crate::tr_dyn(&e)),
                 };
                 ui.label(
                     RichText::new(crate::tr("Occurrences on non-working days move to the next working day. Assign resources to the recurring task to put them on every occurrence."))
@@ -328,7 +326,7 @@ impl RecurringTask {
                         .color(theme::pal().TEXT_WEAK),
                 );
                 if let Some(e) = &self.error {
-                    ui.colored_label(theme::pal().ERROR, e);
+                    ui.colored_label(theme::pal().ERROR, crate::tr_dyn(e));
                 }
                 ui.separator();
                 let row = egui::vec2(ui.available_width(), 24.0);

@@ -12,6 +12,15 @@ pub mod font;
 pub mod layout;
 pub mod network;
 pub mod pdf;
+
+/// Localizes the built-in footer templates without rewriting user-authored header/footer text.
+pub fn template_display(text: &str) -> &str {
+    match text {
+        "Page [Page] of [Pages]" => crate::i18n::tr("Page [Page] of [Pages]"),
+        "Printed [Date]" => crate::i18n::tr("Printed [Date]"),
+        _ => text,
+    }
+}
 mod subset;
 
 use serde::{Deserialize, Serialize};
