@@ -47,10 +47,10 @@ pub fn tools() -> Vec<Tool> {
         Tool::new(
             "open_project",
             "Open a project file",
-            "Open a .plancraft project file (or activate it if it is already open) and make it the active document.",
+            "Open a .plancraft project file (or activate it if it is already open) and make it the active document. A Microsoft Project XML file (.xml, MSPDI) is imported as a new unsaved document instead (opening it again while that import is unsaved activates it): 'import_notes' then lists what could not be carried over, and save_project with a .plancraft 'path' keeps it as a plan.",
             json!({
                 "type": "object",
-                "properties": { "path": string("Path of the .plancraft file to open.") },
+                "properties": { "path": string("Path of the .plancraft file to open, or of a Microsoft Project .xml file to import.") },
                 "required": ["path"],
                 "additionalProperties": false
             }),
@@ -59,15 +59,34 @@ pub fn tools() -> Vec<Tool> {
         Tool::new(
             "save_project",
             "Save a project",
-            "Save the document to its file. With 'path', save as a new file (relative links to external projects are rewritten so they keep working).",
-            schema(json!({ "path": string("Optional new file path (Save As).") }), &[]),
+            "Save the document to its file. With 'path', save as a new file (relative links to external projects are rewritten so they keep working). Fails when another program changed the file since it was opened or last saved, or when 'path' names another existing file, unless overwrite is true.",
+            schema(
+                json!({
+                    "path": string("Optional new file path (Save As)."),
+                    "overwrite": boolean("Replace the file even if another program changed it since it was opened or last saved, or replace the existing file at 'path' (default false). Check with the user first."),
+                }),
+                &[],
+            ),
             save_project,
+        ),
+        Tool::new(
+            "export_mspdi",
+            "Export Microsoft Project XML",
+            "Save the plan as a Microsoft Project XML (MSPDI) file that Microsoft Project and other planning tools can open. The document itself is not changed. 'notes' lists what the format could not carry (for example three-point estimates or Task Board columns). A relative path is relative to the PlanCraft process's working folder.",
+            schema(
+                json!({
+                    "path": string("File path ending in .xml (added when missing)."),
+                    "overwrite": boolean("Replace an existing Microsoft Project XML file at 'path' (default false). Other .xml files are never replaced. Check with the user first."),
+                }),
+                &["path"],
+            ),
+            export_mspdi,
         ),
         Tool::new(
             "close_project",
             "Close a project",
-            "Close a document. Fails when it has unsaved changes unless discard_changes is true.",
-            schema(json!({ "discard_changes": boolean("Close even if there are unsaved changes (default false).") }), &[]),
+            "Close a document. Fails when it has unsaved changes unless discard_changes is true. Unsaved changes the user made in the app are never discarded: ask the user to save or close the document.",
+            schema(json!({ "discard_changes": boolean("Close even if there are unsaved changes made by agents (default false). Never discards the user's own unsaved changes.") }), &[]),
             close_project,
         )
         .destructive(),
@@ -117,6 +136,7 @@ pub fn tools() -> Vec<Tool> {
                     "new_tasks_auto": boolean("New tasks are auto-scheduled (true) or manual (false)."),
                     "use_resource_calendars": boolean("Assigned tasks follow resource calendars and personal time off."),
                     "progress_from_time": boolean("Compute task % complete from tracked time automatically."),
+                    "earned_value_baseline": { "type": ["integer", "string"], "description": "Baseline earned value is measured against: 0-10 or \"baseline\"..\"baseline10\" (default Baseline)." },
                     "critical_slack": duration("Tasks with total slack at or below this are critical (default 0)."),
                 }),
                 &[],
@@ -200,15 +220,27 @@ fn open_project(ctx: &Ctx, a: &Args) -> ToolResult {
     let p = PathBuf::from(&path);
     let p = if p.exists() { p } else { with_extension(&path) };
     let out = ctx.with_workspace(|ws| {
+        let before = ws.docs.len();
         let handle = ws.open(&p)?;
         let i = ws.index_of(handle).ok_or_else(|| missing("opened"))?;
-        Ok(project_overview(doc_at(ws, i)?))
+        let created = ws.docs.len() > before;
+        let doc = doc_at_mut(ws, i)?;
+        if created && doc.imported {
+            // An agent's import is the agent's unsaved work (it may save or close it).
+            doc.user_changes = false;
+        }
+        let mut out = project_overview(doc);
+        if doc.imported && doc.path.is_none() {
+            set(&mut out, "import_notes", json!(doc.load_notes));
+        }
+        Ok(out)
     })?;
     ctx.mark_changed();
     Ok(out)
 }
 
 fn save_project(ctx: &Ctx, a: &Args) -> ToolResult {
+    let overwrite = a.bool("overwrite")?.unwrap_or(false);
     let new_path = match a.str("path")? {
         Some(p) if !p.trim().is_empty() => Some(with_extension(p.trim())),
         _ => None,
@@ -218,16 +250,26 @@ fn save_project(ctx: &Ctx, a: &Args) -> ToolResult {
             Some(p) => {
                 let same =
                     doc.path.as_ref().is_some_and(|cur| std::fs::canonicalize(cur).ok() == std::fs::canonicalize(p).ok() && p.exists());
-                if !same {
+                if same {
+                    // Saving to its own file is a plain Save, with the same check for changes
+                    // made by another program.
+                    if overwrite { doc.save_overwriting()? } else { doc.save()? }
+                } else {
                     ctx.require_file_access("Saving to a new path")?;
+                    if p.exists() && !overwrite {
+                        return err(format!(
+                            "{} already exists; pass overwrite: true to replace it (check with the user first)",
+                            p.display()
+                        ));
+                    }
+                    doc.save_as(p)?
                 }
-                doc.save_as(p)?
             }
             None => {
                 if doc.path.is_none() {
                     return err("the document has never been saved; pass 'path' to choose a file");
                 }
-                doc.save()?
+                if overwrite { doc.save_overwriting()? } else { doc.save()? }
             }
         }
         Ok(json!({
@@ -240,11 +282,48 @@ fn save_project(ctx: &Ctx, a: &Args) -> ToolResult {
     Ok(out)
 }
 
+fn export_mspdi(ctx: &Ctx, a: &Args) -> ToolResult {
+    ctx.require_file_access("Exporting files")?;
+    let overwrite = a.bool("overwrite")?.unwrap_or(false);
+    let raw = a.req_str("path")?.trim();
+    if raw.is_empty() {
+        return err("'path' is empty");
+    }
+    let ext = plancraft_core::mspdi::EXTENSION;
+    let path = PathBuf::from(raw);
+    let path = match path.extension() {
+        None => path.with_extension(ext),
+        Some(e) if e.eq_ignore_ascii_case(ext) => path,
+        Some(_) => return err("'path' must end in .xml"),
+    };
+    let path = if path.is_absolute() { path } else { std::env::current_dir().map(|c| c.join(&path)).unwrap_or(path) };
+    if path.exists() {
+        if !overwrite {
+            return err(format!("{} already exists; pass overwrite: true to replace it (check with the user first)", path.display()));
+        }
+        // .xml files are everywhere (build files, settings): only another Project file is replaced.
+        if !plancraft_core::mspdi::is_mspdi_file(&path) {
+            return err(format!("{} is not a Microsoft Project XML file, so it is not replaced; choose another path", path.display()));
+        }
+    }
+    // Copy the plan, then write without holding the workspace.
+    let project = ctx.read(a, |doc| Ok(doc.project.clone()))?;
+    let notes = plancraft_core::mspdi::save(&project, &path)?;
+    Ok(json!({ "path": path.display().to_string(), "tasks": project.tasks.len(), "notes": notes }))
+}
+
 fn close_project(ctx: &Ctx, a: &Args) -> ToolResult {
     let discard = a.bool("discard_changes")?.unwrap_or(false);
     let out = ctx.with_workspace(|ws| {
         let i = Ctx::doc_index(ws, a)?;
         let doc = doc_at(ws, i)?;
+        if doc.user_changes {
+            // The user's unsaved work is theirs to keep or throw away, not an agent's.
+            return err(format!(
+                "'{}' has unsaved changes made by the user in PlanCraft; ask the user to save or close it (save_project saves it)",
+                doc.title()
+            ));
+        }
         if doc.dirty && !discard {
             return err(format!("'{}' has unsaved changes; call save_project first or pass discard_changes: true", doc.title()));
         }
@@ -360,6 +439,9 @@ fn update_project(ctx: &Ctx, a: &Args) -> ToolResult {
             }
             if let Some(b) = a.bool("progress_from_time")? {
                 p.settings.progress_from_time = b;
+            }
+            if let Some(n) = super::analysis::baseline_number(a, "earned_value_baseline")? {
+                p.set_earned_value_baseline(n)?;
             }
             if let Some(v) = a.get("critical_slack") {
                 p.settings.critical_slack = parse_duration_value(p, v, "critical_slack")?.0;

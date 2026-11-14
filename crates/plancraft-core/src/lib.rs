@@ -16,7 +16,11 @@
 //! ```
 
 pub mod attach;
+pub mod baseline;
+pub mod bidi;
+pub mod board;
 pub mod calendar;
+pub mod custom;
 pub mod duration;
 pub mod extras;
 pub mod guard;
@@ -27,21 +31,29 @@ pub mod io;
 pub mod leveling;
 pub mod limits;
 pub mod model;
+pub mod mspdi;
+pub mod network;
 pub mod ops;
 pub mod paths;
+pub mod print;
+pub mod recurring;
 pub mod report;
 pub mod sample;
 pub mod schedule;
+pub mod split;
 pub mod templates;
+pub mod timescale;
 pub mod workload;
 pub mod workspace;
 
 pub mod prelude {
+    pub use crate::baseline::{PlanSlot, Scope};
     pub use crate::calendar::{Calendar, CalendarException, TimeRange, WorkCal, WorkWeek};
+    pub use crate::custom::{CustomFieldDef, CustomFieldKind, CustomValue, TableLayout};
     pub use crate::duration::{DurationUnit, Lag, Minutes, TimeSettings, format_duration, format_work, parse_duration, parse_work};
     pub use crate::ids::*;
     pub use crate::model::*;
-    pub use crate::ops::{PlanError, PlanResult};
+    pub use crate::ops::{PlanError, PlanResult, ProgressUpdate, TrackingReport};
     pub use crate::schedule::{ScheduleReport, recalculate};
     pub use crate::workload::{Granularity, WorkloadReport, workload};
 }

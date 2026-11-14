@@ -14,6 +14,9 @@ use crate::widgets::grid::GridState;
 pub enum ViewKind {
     Gantt,
     TrackingGantt,
+    MultipleBaselines,
+    NetworkDiagram,
+    Board,
     TaskUsage,
     Milestones,
     ResourceSheet,
@@ -29,6 +32,9 @@ impl ViewKind {
         match self {
             ViewKind::Gantt => crate::tr("Gantt Chart"),
             ViewKind::TrackingGantt => crate::tr("Tracking Gantt"),
+            ViewKind::MultipleBaselines => crate::tr("Multiple Baselines Gantt"),
+            ViewKind::NetworkDiagram => crate::tr("Network Diagram"),
+            ViewKind::Board => crate::tr("Task Board"),
             ViewKind::TaskUsage => crate::tr("Task Usage"),
             ViewKind::Milestones => crate::tr("Milestones"),
             ViewKind::ResourceSheet => crate::tr("Resource Sheet"),
@@ -44,6 +50,9 @@ impl ViewKind {
         match self {
             ViewKind::Gantt => "📊",
             ViewKind::TrackingGantt => "📈",
+            ViewKind::MultipleBaselines => "📚",
+            ViewKind::NetworkDiagram => "🔀",
+            ViewKind::Board => "📇",
             ViewKind::TaskUsage => "📝",
             ViewKind::Milestones => "♦",
             ViewKind::ResourceSheet => "👥",
@@ -55,9 +64,12 @@ impl ViewKind {
         }
     }
 
-    pub const ALL: [ViewKind; 10] = [
+    pub const ALL: [ViewKind; 13] = [
         ViewKind::Gantt,
         ViewKind::TrackingGantt,
+        ViewKind::MultipleBaselines,
+        ViewKind::NetworkDiagram,
+        ViewKind::Board,
         ViewKind::TaskUsage,
         ViewKind::Milestones,
         ViewKind::Calendar,
@@ -93,7 +105,7 @@ impl MenuTab {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum TaskFilter {
     #[default]
     All,
@@ -167,6 +179,20 @@ pub enum TaskGroup {
 }
 
 impl TaskGroup {
+    pub fn key(self) -> Option<&'static str> {
+        Some(match self {
+            Self::None => return None,
+            Self::CompleteIncomplete => "legacy:complete",
+            Self::ConstraintType => "legacy:constraint",
+            Self::Critical => "legacy:critical",
+            Self::Duration => "legacy:duration",
+            Self::Milestones => "legacy:milestones",
+            Self::Priority => "legacy:priority",
+            Self::Resource => "legacy:resource",
+            Self::Status => "legacy:status",
+        })
+    }
+
     pub const ALL: [TaskGroup; 9] = [
         TaskGroup::None,
         TaskGroup::CompleteIncomplete,
@@ -218,13 +244,133 @@ impl ResourceGroup {
     }
 }
 
+/// Network Diagram drag in progress.
+#[derive(Clone, Debug)]
+pub enum NetDrag {
+    /// Moving the view (diagram point under the pointer when the drag started).
+    Pan { grab: egui::Pos2 },
+    /// Drawing a link from a box.
+    Link { from: TaskId },
+}
+
+/// A card (or the selected cards) being dragged on the Task Board.
+#[derive(Clone, Debug)]
+pub struct BoardDrag {
+    pub tasks: Vec<TaskId>,
+}
+
+/// The Board Column window: rename a column and set its % complete, or add one.
+#[derive(Clone, Debug)]
+pub struct ColumnEdit {
+    /// The column changed (`None`: a new one).
+    pub id: Option<plancraft_core::ids::BoardColumnId>,
+    pub name: String,
+    pub percent: String,
+    pub error: Option<String>,
+}
+
+impl ColumnEdit {
+    pub fn new_column() -> Self {
+        Self { id: None, name: String::new(), percent: String::new(), error: None }
+    }
+
+    pub fn existing(c: &plancraft_core::board::BoardColumn) -> Self {
+        Self { id: Some(c.id), name: c.name.clone(), percent: c.percent_complete.map(|v| v.to_string()).unwrap_or_default(), error: None }
+    }
+}
+
+/// Task Board view state.
+pub struct BoardState {
+    pub scroll: egui::Vec2,
+    pub drag: Option<BoardDrag>,
+    pub edit: Option<ColumnEdit>,
+    /// What the open context menu is for: a column header (`Some(id)`) or cards (`None`).
+    pub menu: Option<Option<plancraft_core::ids::BoardColumnId>>,
+    /// Where the cards were drawn on the last frame (columns start at its left edge).
+    pub body: egui::Rect,
+    /// Scroll the selected card into view on the next frame.
+    pub reveal_pending: bool,
+}
+
+impl Default for BoardState {
+    fn default() -> Self {
+        Self { scroll: egui::Vec2::ZERO, drag: None, edit: None, menu: None, body: egui::Rect::NOTHING, reveal_pending: false }
+    }
+}
+
+/// Network Diagram view: where it is scrolled to, zoom, options and the cached layout.
+pub struct NetworkState {
+    /// Diagram point at the top-left corner of the view.
+    pub offset: egui::Pos2,
+    pub zoom: f32,
+    pub opts: plancraft_core::network::NetworkOptions,
+    pub show_summaries: bool,
+    pub link_labels: bool,
+    pub progress_marks: bool,
+    pub drag: Option<NetDrag>,
+    /// Zoom out to show the whole diagram on the next frame.
+    pub fit_pending: bool,
+    /// Scroll the selected task into view on the next frame.
+    pub reveal_pending: bool,
+    /// Zoom to the selected tasks on the next frame.
+    pub fit_selected_pending: bool,
+    /// Layout of the last frame, with the key it was made for.
+    pub cache: Option<(u64, std::sync::Arc<plancraft_core::network::Diagram>)>,
+    /// Document the view was last shown for (another one starts at the top left).
+    pub shown_for: Option<u64>,
+    /// Where the view was drawn on the last frame (for zooming about its centre).
+    pub view_rect: egui::Rect,
+}
+
+impl Default for NetworkState {
+    fn default() -> Self {
+        Self {
+            offset: egui::Pos2::ZERO,
+            zoom: 1.0,
+            opts: Default::default(),
+            show_summaries: true,
+            link_labels: false,
+            progress_marks: true,
+            drag: None,
+            fit_pending: false,
+            reveal_pending: true,
+            fit_selected_pending: false,
+            cache: None,
+            shown_for: None,
+            view_rect: egui::Rect::NOTHING,
+        }
+    }
+}
+
 /// Gantt-chart drag in progress.
 #[derive(Clone, Debug)]
 pub enum BarDrag {
-    Move { task: TaskId, grab_dx: f32, origin_start: NaiveDateTime },
-    Resize { task: TaskId },
-    Progress { task: TaskId },
-    Link { from: TaskId },
+    Move {
+        task: TaskId,
+        grab_dx: f32,
+        origin_start: NaiveDateTime,
+    },
+    Resize {
+        task: TaskId,
+    },
+    Progress {
+        task: TaskId,
+    },
+    Link {
+        from: TaskId,
+    },
+    /// A later part of a split task (part `k`, from 0), moved on its own.
+    Part {
+        task: TaskId,
+        k: usize,
+        grab_dx: f32,
+        origin: NaiveDateTime,
+    },
+    /// The right end of part `k` (not the last) of a split task.
+    PartEnd {
+        task: TaskId,
+        k: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +381,12 @@ pub struct GanttState {
     pub drag: Option<BarDrag>,
     pub show_critical: bool,
     pub show_baseline: bool,
+    /// Split Task: the next click on a bar splits the task there.
+    pub split_mode: bool,
+    /// The baseline (0–10) the Gantt Chart and Tracking Gantt draw under each bar.
+    pub baseline_slot: u8,
+    /// Baselines shown in the Multiple Baselines Gantt (bit n = Baseline n).
+    pub multi_baselines: u16,
     pub show_slack: bool,
     pub show_links: bool,
     pub show_resource_names: bool,
@@ -251,6 +403,9 @@ impl Default for GanttState {
             drag: None,
             show_critical: false,
             show_baseline: false,
+            split_mode: false,
+            baseline_slot: 0,
+            multi_baselines: 0b111,
             show_slack: false,
             show_links: true,
             show_resource_names: true,
@@ -298,6 +453,7 @@ impl GanttState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
     Info,
     Success,
@@ -342,6 +498,14 @@ impl Selection {
     }
 }
 
+/// How a document's task views are sorted and grouped (kept per document).
+#[derive(Clone, Debug, Default)]
+pub struct ViewOrder {
+    pub sort: Option<(String, bool)>,
+    pub group: Option<String>,
+    pub collapsed_groups: HashSet<String>,
+}
+
 pub struct UiState {
     pub view: ViewKind,
     pub menu_tab: MenuTab,
@@ -358,8 +522,24 @@ pub struct UiState {
     pub collapsed_resources: HashSet<ResourceId>,
     pub filter: TaskFilter,
     pub search: String,
+    /// Sort of task views: field key and descending.
+    pub sort: Option<(String, bool)>,
+    /// Field key task views are grouped by.
+    pub group: Option<String>,
+    /// Collapsed group headers (by label).
+    pub collapsed_groups: HashSet<String>,
+    /// Sort, grouping and collapsed groups of the documents not active now (by handle): field
+    /// keys like `custom:3` mean different fields in different plans.
+    pub view_orders: std::collections::HashMap<u64, ViewOrder>,
+    /// The task grid's cursor row at the end of the last frame and the task on it, so the cursor
+    /// (and an open editor) follow that task when the rows re-sort or regroup.
+    pub cursor_task: Option<(usize, TaskId)>,
+    /// Column widths of task tables, by table and field key (survive column changes).
+    pub column_widths: std::collections::HashMap<(TaskTable, String), f32>,
     pub table: TaskTable,
     pub gantt: GanttState,
+    pub network: NetworkState,
+    pub board: BoardState,
     pub table_width: f32,
     pub timeline_visible: bool,
     pub granularity: Granularity,
@@ -374,8 +554,6 @@ pub struct UiState {
     pub show_history: bool,
     /// Threshold typed for "Cost greater than", "Work greater than" (hours) or "Starting soon" (days).
     pub filter_value: String,
-    /// Display sort of task views (keeps the outline: siblings are sorted).
-    pub sort: plancraft_core::extras::SortKey,
     /// Show tasks down to this outline level (0 = all).
     pub show_level: u16,
     /// Which details the usage views show.
@@ -383,10 +561,7 @@ pub struct UiState {
     /// Only the tab row is shown (double-click a tab to toggle).
     pub ribbon_collapsed: bool,
     /// "Group by" of task views and of the Resource Sheet.
-    pub group: TaskGroup,
     pub resource_group: ResourceGroup,
-    /// Collapsed group headers (by label).
-    pub collapsed_groups: HashSet<String>,
 }
 
 /// Rows shown per assignment in Task Usage / Resource Usage ("Format > Details").
@@ -416,8 +591,16 @@ impl Default for UiState {
             collapsed_resources: HashSet::new(),
             filter: TaskFilter::All,
             search: String::new(),
+            sort: None,
+            group: None,
+            collapsed_groups: HashSet::new(),
+            view_orders: Default::default(),
+            cursor_task: None,
+            column_widths: std::collections::HashMap::new(),
             table: TaskTable::Entry,
             gantt: GanttState::default(),
+            network: NetworkState::default(),
+            board: BoardState::default(),
             table_width: 720.0,
             timeline_visible: true,
             granularity: Granularity::Day,
@@ -430,13 +613,10 @@ impl Default for UiState {
             task_clipboard_text: None,
             show_history: false,
             filter_value: String::new(),
-            sort: plancraft_core::extras::SortKey::Id,
             show_level: 0,
             usage_detail: UsageDetail::Work,
             ribbon_collapsed: false,
-            group: TaskGroup::None,
             resource_group: ResourceGroup::None,
-            collapsed_groups: HashSet::new(),
         }
     }
 }

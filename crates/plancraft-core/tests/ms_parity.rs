@@ -587,3 +587,990 @@ fn must_finish_on_fixes_finish() {
     assert_eq!(finish(&p, t), dt(2026, 10, 28, 17));
     assert_eq!(start(&p, t), dt(2026, 10, 27, 8));
 }
+
+// ===========================================================================
+// Inactive tasks, summary constraints and deadlines, earned value
+// ===========================================================================
+
+// Source: https://support.microsoft.com/en-us/project/inactivate-a-task — "Inactivate a task"
+// An inactive task does not affect the schedule or how other tasks are scheduled, so it must not
+// shorten its predecessors' slack.
+#[test]
+fn inactive_successor_does_not_drive_predecessor_slack() {
+    let mut p = project();
+    let _long = task(&mut p, "R", 10 * DAY);
+    let pred = task(&mut p, "P", 2 * DAY);
+    let inactive = task(&mut p, "Q", 20 * DAY);
+    p.link(pred.into(), inactive, LinkType::FS, Lag::None).unwrap();
+    p.task_mut(inactive).unwrap().active = false;
+    recalculate(&mut p);
+    assert_eq!(finish(&p, pred), dt(2026, 10, 20, 17));
+    assert_eq!(p.task(pred).unwrap().sched.total_slack, 8 * DAY);
+    assert!(!p.task(pred).unwrap().sched.critical);
+}
+
+// Source: https://support.microsoft.com/en-us/office/view-and-track-scheduling-factors-647becca-89da-4f58-a790-ba0ee8765683 — "Summary Task"
+// A Start No Earlier Than constraint on a summary task drives its subtasks' start dates.
+#[test]
+fn summary_start_no_earlier_than_drives_subtasks() {
+    let mut p = project();
+    let s = p.add_task("Phase", None);
+    let a = task(&mut p, "A", 2 * DAY);
+    let b = task(&mut p, "B", DAY);
+    p.indent(a).unwrap();
+    p.indent(b).unwrap();
+    constrain(&mut p, s, ConstraintKind::Snet, dt(2026, 11, 2, 8));
+    recalculate(&mut p);
+    assert_eq!(start(&p, a), dt(2026, 11, 2, 8));
+    assert_eq!(start(&p, b), dt(2026, 11, 2, 8));
+    assert_eq!(start(&p, s), dt(2026, 11, 2, 8));
+}
+
+// Source: https://support.microsoft.com/en-us/project/how-project-schedules-tasks-behind-the-scenes — "How do deadline dates affect the schedule?"
+// Deadlines can be set on summary tasks; they affect total slack (not the dates), and a summary
+// whose subtasks finish after its deadline shows a missed deadline.
+#[test]
+fn summary_deadline_reduces_subtask_slack_and_is_flagged() {
+    let mut p = project();
+    let s = p.add_task("Phase", None);
+    let a = task(&mut p, "A", 5 * DAY);
+    p.indent(a).unwrap();
+    p.task_mut(s).unwrap().deadline = Some(dt(2026, 10, 21, 17));
+    recalculate(&mut p);
+    assert_eq!(start(&p, a), dt(2026, 10, 19, 8), "a deadline does not move the task");
+    assert_eq!(p.task(a).unwrap().sched.total_slack, -2 * DAY);
+    assert!(p.task(a).unwrap().sched.critical);
+    assert!(p.task(s).unwrap().sched.warnings.iter().any(|w| w.contains("deadline")), "{:?}", p.task(s).unwrap().sched.warnings);
+}
+
+// Source: https://support.microsoft.com/en-us/office/acwp-fields-710a1c21-b9f1-4516-9c78-986e87345277 — "How Calculated"
+// ACWP is the cost of the work done so far; progress entered as % complete (not only actual work)
+// makes Project calculate it. A 10-day task at $100/h that is 50% complete has cost $4,000 so far.
+#[test]
+fn acwp_counts_progress_entered_as_percent_complete() {
+    let mut p = project();
+    let t = task(&mut p, "Build", 10 * DAY);
+    let r = p.add_resource("Ana");
+    p.resource_mut(r).unwrap().standard_rate = 100.0;
+    p.assign(t, r, Some(1.0), None).unwrap();
+    recalculate(&mut p);
+    p.set_baseline(&[]);
+    p.set_percent_complete(t, 50).unwrap();
+    recalculate(&mut p);
+    let ev = plancraft_core::report::earned_value(&p, dt(2026, 10, 23, 17)).unwrap();
+    assert!((ev.acwp - 4000.0).abs() < 1e-6, "ACWP {}", ev.acwp);
+    assert!((ev.bcwp - 4000.0).abs() < 1e-6, "BCWP {}", ev.bcwp);
+    assert!((ev.cpi - 1.0).abs() < 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// Tracking: Stop/Resume, Update Project, Mark on Track
+// ---------------------------------------------------------------------------
+
+/// The plan used by the Update Project examples: A (2 days) → B (3 days) → C (2 days).
+fn chain_abc() -> (Project, TaskId, TaskId, TaskId) {
+    let mut p = project();
+    let a = task(&mut p, "A", 2 * DAY);
+    let b = task(&mut p, "B", 3 * DAY);
+    let c = task(&mut p, "C", 2 * DAY);
+    p.link_chain(&[a, b, c]).unwrap();
+    recalculate(&mut p);
+    (p, a, b, c)
+}
+
+fn pct(p: &Project, id: TaskId) -> u8 {
+    p.task(id).unwrap().percent_complete
+}
+
+// Source: https://support.microsoft.com/en-us/office/stop-task-field-9664ffef-0df9-4b37-aeb2-8e26bdadcbcf — "Example"
+// A two-day task marked 50% complete on its first day stops at the end of that day, and its
+// remaining half is scheduled from the next morning.
+#[test]
+fn stop_marks_the_end_of_the_completed_part() {
+    let mut p = project();
+    let t = task(&mut p, "Conduct client meetings", 2 * DAY);
+    recalculate(&mut p);
+    p.set_percent_complete(t, 50).unwrap();
+    recalculate(&mut p);
+    let s = &p.task(t).unwrap().sched;
+    assert_eq!(s.stop, Some(dt(2026, 10, 19, 17)));
+    assert_eq!(s.resume, Some(dt(2026, 10, 20, 8)));
+    assert_eq!(finish(&p, t), dt(2026, 10, 20, 17));
+}
+
+// Source: https://support.microsoft.com/en-us/office/resume-task-field-a6ae83cc-bde9-44f6-8bc0-aca8514de2b1 — "Examples"
+// When the remaining half of a two-day, 50%-complete task can only happen on a later date,
+// entering that date as the Resume date schedules the rest of the task there.
+#[test]
+fn resume_date_moves_the_remaining_work() {
+    let mut p = project();
+    let t = task(&mut p, "Conduct client meetings", 2 * DAY);
+    recalculate(&mut p);
+    p.set_percent_complete(t, 50).unwrap();
+    p.set_resume(t, Some(dt(2026, 11, 2, 8))).unwrap();
+    recalculate(&mut p);
+    let s = &p.task(t).unwrap().sched;
+    assert_eq!(start(&p, t), dt(2026, 10, 19, 8), "the actual start stays");
+    assert_eq!(s.stop, Some(dt(2026, 10, 19, 17)));
+    assert_eq!(s.resume, Some(dt(2026, 11, 2, 8)));
+    assert_eq!(finish(&p, t), dt(2026, 11, 2, 17));
+    // PlanCraft's choice (the page does not say): the pause does not count as duration.
+    assert_eq!(duration(&p, t), 2 * DAY, "the gap is not working time");
+}
+
+// Source: https://support.microsoft.com/en-us/office/update-completed-tasks-quickly-9c963543-f767-4b5b-ac5b-f0f465206fdb — "Update tasks to 100% complete for a specific date"
+// Update Project with "Set 0% or 100% complete only" marks the tasks that finish by the date as
+// 100% complete and leaves the others alone.
+#[test]
+fn update_project_zero_or_hundred_completes_tasks_finished_by_the_date() {
+    let (mut p, a, b, c) = chain_abc();
+    let through = p.end_of_working_day(d(2026, 10, 21));
+    let r = p.update_progress_through(&[], through, ProgressUpdate::ZeroOrHundred).unwrap();
+    recalculate(&mut p);
+    assert_eq!((pct(&p, a), pct(&p, b), pct(&p, c)), (100, 0, 0));
+    assert_eq!(r.updated, vec![a]);
+    assert_eq!(p.task(a).unwrap().actual_finish, Some(dt(2026, 10, 20, 17)));
+}
+
+// Source: https://support.microsoft.com/en-us/office/update-completed-tasks-quickly-9c963543-f767-4b5b-ac5b-f0f465206fdb — "Update tasks to scheduled percent complete for a specific date"
+// With "Set 0% - 100% complete" each task gets the progress its schedule says it should have by
+// the date: one day into a three-day task is a third done.
+#[test]
+fn update_project_sets_scheduled_percent_complete() {
+    let (mut p, a, b, c) = chain_abc();
+    let through = p.end_of_working_day(d(2026, 10, 21));
+    p.update_progress_through(&[], through, ProgressUpdate::Scheduled).unwrap();
+    recalculate(&mut p);
+    assert_eq!((pct(&p, a), pct(&p, b), pct(&p, c)), (100, 33, 0));
+    assert_eq!(p.task(b).unwrap().actual_start, Some(dt(2026, 10, 21, 8)));
+}
+
+// Source: https://support.microsoft.com/en-us/office/update-completed-tasks-quickly-9c963543-f767-4b5b-ac5b-f0f465206fdb — "Update tasks to scheduled percent complete for the current or status date"
+// Mark on Track sets the selected tasks to their scheduled percent complete as of the status date.
+#[test]
+fn mark_on_track_uses_the_status_date() {
+    let (mut p, a, b, c) = chain_abc();
+    p.set_status_date(Some(d(2026, 10, 22)));
+    p.mark_on_track(&[b]).unwrap();
+    recalculate(&mut p);
+    assert_eq!((pct(&p, a), pct(&p, b), pct(&p, c)), (0, 67, 0), "only the selected task changes");
+}
+
+// Source: https://support.microsoft.com/en-us/project/set-the-start-date-or-finish-date-for-your-project-in-project-desktop — "Move the start time of a project"
+// "Reschedule uncompleted work to start after" schedules work not yet done after the chosen date,
+// and actual dates on tasks do not move.
+#[test]
+fn reschedule_uncompleted_work_keeps_actuals_and_moves_the_rest() {
+    let mut p = project();
+    let a = task(&mut p, "A", 2 * DAY);
+    let b = task(&mut p, "B", 4 * DAY);
+    let c = task(&mut p, "C", 2 * DAY);
+    let free = task(&mut p, "Unlinked", DAY);
+    p.link_chain(&[a, b, c]).unwrap();
+    recalculate(&mut p);
+    p.set_percent_complete(a, 100).unwrap();
+    recalculate(&mut p);
+    p.set_percent_complete(b, 25).unwrap();
+    recalculate(&mut p);
+    assert_eq!(start(&p, b), dt(2026, 10, 21, 8));
+
+    let after = p.end_of_working_day(d(2026, 10, 26));
+    let r = p.reschedule_uncompleted_work(&[], after).unwrap();
+    recalculate(&mut p);
+    // How the work moves is PlanCraft's choice (the page only says it moves after the date and
+    // actual dates stay): a task in progress pauses until then, and an unlinked task not started
+    // gets a Start No Earlier Than date.
+    assert_eq!(r.split, vec![b]);
+    assert_eq!(r.constrained, vec![free], "C follows B through its link; only the unlinked task needs a date");
+    assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+
+    assert_eq!((start(&p, a), finish(&p, a)), (dt(2026, 10, 19, 8), dt(2026, 10, 20, 17)), "actual dates stay");
+    let s = &p.task(b).unwrap().sched;
+    assert_eq!(start(&p, b), dt(2026, 10, 21, 8), "the actual start stays");
+    assert_eq!(s.stop, Some(dt(2026, 10, 21, 17)));
+    assert_eq!(s.resume, Some(dt(2026, 10, 27, 8)));
+    assert_eq!(finish(&p, b), dt(2026, 10, 29, 17));
+    assert_eq!(start(&p, c), dt(2026, 10, 30, 8));
+    assert_eq!(start(&p, free), dt(2026, 10, 27, 8));
+}
+
+// Source: https://support.microsoft.com/en-us/project/update-work-on-a-project — "Update actual and remaining duration"
+// Entering actual duration calculates % complete and remaining duration.
+#[test]
+fn actual_duration_sets_percent_complete() {
+    let mut p = project();
+    let t = task(&mut p, "Build", 10 * DAY);
+    recalculate(&mut p);
+    p.set_actual_duration(t, 4 * DAY).unwrap();
+    recalculate(&mut p);
+    let task = p.task(t).unwrap();
+    assert_eq!(task.percent_complete, 40);
+    assert_eq!(task.remaining_duration(), 6 * DAY);
+    assert_eq!(task.actual_start, Some(dt(2026, 10, 19, 8)));
+}
+
+// Source: https://support.microsoft.com/en-us/project/update-work-on-a-project — "Update actual and remaining duration"
+// Entering remaining duration recalculates the duration and % complete.
+#[test]
+fn remaining_duration_recalculates_duration_and_percent() {
+    let mut p = project();
+    let t = task(&mut p, "Build", 10 * DAY);
+    recalculate(&mut p);
+    p.set_percent_complete(t, 40).unwrap();
+    p.set_remaining_duration(t, 12 * DAY).unwrap();
+    recalculate(&mut p);
+    let task = p.task(t).unwrap();
+    assert_eq!(task.duration, 16 * DAY, "4 days done + 12 days left");
+    assert_eq!(task.percent_complete, 25);
+    assert_eq!(finish(&p, t), dt(2026, 11, 9, 17));
+}
+
+// Source: https://support.microsoft.com/en-us/project/update-work-on-a-project — "Update actual and remaining duration"
+// An actual duration longer than the scheduled duration raises the duration to match, leaves no
+// remaining duration and marks the task 100% complete.
+#[test]
+fn actual_duration_past_the_plan_completes_the_task() {
+    let mut p = project();
+    let t = task(&mut p, "Build", 2 * DAY);
+    recalculate(&mut p);
+    p.set_actual_duration(t, 3 * DAY).unwrap();
+    recalculate(&mut p);
+    let task = p.task(t).unwrap();
+    assert_eq!((task.duration, task.percent_complete, task.remaining_duration()), (3 * DAY, 100, 0));
+    assert_eq!(task.actual_finish, Some(dt(2026, 10, 21, 17)));
+}
+
+// ---------------------------------------------------------------------------
+// Baselines and interim plans
+// ---------------------------------------------------------------------------
+
+/// Phase (summary) over A (2 days, fixed cost 100), plus D (1 day, fixed cost 50) added under it
+/// after Baseline was saved for the whole plan.
+fn baselined_phase() -> (Project, TaskId, TaskId, TaskId) {
+    let mut p = project();
+    let s = p.add_task("Phase", None);
+    let a = task(&mut p, "A", 2 * DAY);
+    p.indent(a).unwrap();
+    p.task_mut(a).unwrap().fixed_cost = 100.0;
+    recalculate(&mut p);
+    p.set_baseline(&[]);
+    let d = p.add_task("D", None);
+    p.set_duration(d, DAY, false).unwrap();
+    p.task_mut(d).unwrap().fixed_cost = 50.0;
+    p.link(a.into(), d, LinkType::FS, Lag::None).unwrap();
+    recalculate(&mut p);
+    assert_eq!(p.parent_index(p.task_index(d).unwrap()), Some(0), "D is a subtask of Phase, like A");
+    (p, s, a, d)
+}
+
+// Source: https://support.microsoft.com/en-us/office/create-or-update-a-baseline-or-an-interim-plan-in-project-desktop-7e775482-ac84-4f4a-bbd0-592f9ac91953 — "Update a baseline or an interim plan"
+// Saving a baseline for selected tasks only does not roll it up into their summary task unless
+// the roll-up options are chosen, so the summary (and the project total built from it) keeps
+// its older baseline figures.
+#[test]
+fn baselining_selected_tasks_does_not_update_their_summary_baseline() {
+    let (mut p, s, _, d) = baselined_phase();
+    p.set_baseline_in(0, &Scope::selected(vec![d])).unwrap();
+    assert_eq!(p.task(d).unwrap().baseline.unwrap().cost, 50.0);
+    assert_eq!(p.task(s).unwrap().baseline.unwrap().cost, 100.0, "the summary keeps its baseline");
+    assert_eq!(plancraft_core::report::project_stats(&p).baseline_cost, 100.0);
+}
+
+// Source: https://support.microsoft.com/en-us/office/create-or-update-a-baseline-or-an-interim-plan-in-project-desktop-7e775482-ac84-4f4a-bbd0-592f9ac91953 — "Set a baseline"
+// "To all summary tasks" rolls the selected tasks' new baseline values up into their summary
+// tasks, so the summary's baseline matches its subtasks again.
+#[test]
+fn rolling_a_selected_baseline_up_to_all_summary_tasks() {
+    let (mut p, s, a, d) = baselined_phase();
+    p.set_baseline_in(0, &Scope { tasks: vec![d], roll_up_to_summaries: true, ..Scope::default() }).unwrap();
+    let sb = p.task(s).unwrap().baseline.unwrap();
+    assert_eq!(sb.cost, 150.0, "A's 100 plus D's 50");
+    assert_eq!(sb.start, p.task(a).unwrap().baseline.unwrap().start);
+    assert_eq!(sb.finish, dt(2026, 10, 21, 17), "D's baseline finish (day 3)");
+    assert_eq!(sb.duration, 3 * DAY);
+    assert_eq!(plancraft_core::report::project_stats(&p).baseline_cost, 150.0);
+}
+
+// Source: https://support.microsoft.com/en-us/office/create-or-update-a-baseline-or-an-interim-plan-in-project-desktop-7e775482-ac84-4f4a-bbd0-592f9ac91953 — "Set a baseline"
+// "From subtasks into selected summary task(s)" updates a selected summary's baseline from its
+// subtasks' saved baselines, picking up a subtask that was added and baselined later.
+#[test]
+fn rolling_subtask_baselines_into_a_selected_summary() {
+    let (mut p, s, _, d) = baselined_phase();
+    p.set_baseline_in(0, &Scope::selected(vec![d])).unwrap();
+    assert_eq!(p.task(s).unwrap().baseline.unwrap().cost, 100.0);
+    p.set_baseline_in(0, &Scope { tasks: vec![s], roll_up_from_subtasks: true, ..Scope::default() }).unwrap();
+    assert_eq!(p.task(s).unwrap().baseline.unwrap().cost, 150.0);
+    assert_eq!(p.task(s).unwrap().baseline.unwrap().finish, dt(2026, 10, 21, 17));
+}
+
+// Source: https://support.microsoft.com/en-us/office/create-or-update-a-baseline-or-an-interim-plan-in-project-desktop-7e775482-ac84-4f4a-bbd0-592f9ac91953 — "Learn more about baselines and interim plans"
+// A plan keeps up to 11 baselines (Baseline and Baseline1–10); saving one leaves the others as
+// they were, so later snapshots can be compared with the original plan.
+#[test]
+fn eleven_independent_baselines() {
+    let mut p = project();
+    let a = task(&mut p, "A", 2 * DAY);
+    recalculate(&mut p);
+    p.set_baseline_in(0, &Scope::entire_project()).unwrap();
+    p.set_duration(a, 4 * DAY, false).unwrap();
+    recalculate(&mut p);
+    for n in 1..=10 {
+        p.set_baseline_in(n, &Scope::entire_project()).unwrap();
+    }
+    assert!(p.set_baseline_in(11, &Scope::entire_project()).is_err(), "there is no Baseline11");
+    let t = p.task(a).unwrap();
+    assert_eq!(t.baseline_in(0).unwrap().finish, dt(2026, 10, 20, 17));
+    assert!((1..=10).all(|n| t.baseline_in(n).unwrap().finish == dt(2026, 10, 22, 17)));
+}
+
+// Source: https://support.microsoft.com/en-us/office/create-or-update-a-baseline-or-an-interim-plan-in-project-desktop-7e775482-ac84-4f4a-bbd0-592f9ac91953 — "Analyze baseline and interim data"
+// Variance is calculated from Baseline only, not from Baseline1–10: with only Baseline1 saved,
+// a task has no baseline to vary from.
+#[test]
+fn variance_uses_baseline_not_the_numbered_ones() {
+    let mut p = project();
+    let a = task(&mut p, "A", 2 * DAY);
+    recalculate(&mut p);
+    p.set_baseline_in(1, &Scope::entire_project()).unwrap();
+    let stats = plancraft_core::report::project_stats(&p);
+    assert_eq!(stats.baseline_finish, None);
+    assert_eq!(stats.baseline_cost, 0.0);
+    assert!(p.task(a).unwrap().baseline.is_none());
+}
+
+// Source: https://support.microsoft.com/en-us/office/create-or-update-a-baseline-or-an-interim-plan-in-project-desktop-7e775482-ac84-4f4a-bbd0-592f9ac91953 — "Set an interim plan"
+// Copying into an interim plan keeps only start and finish dates; copying one baseline into
+// another copies all of its values.
+#[test]
+fn interim_plans_hold_dates_and_baseline_copies_hold_everything() {
+    let (mut p, _, a, _) = baselined_phase();
+    let all = Scope::entire_project();
+    assert_eq!(p.save_baseline_plan(PlanSlot::Scheduled, PlanSlot::Interim(1), &all).unwrap(), 3);
+    let t = p.task(a).unwrap();
+    assert_eq!(t.interim_in(1).map(|i| (i.start, i.finish)), t.sched.start.zip(t.sched.finish));
+    p.save_baseline_plan(PlanSlot::Baseline(0), PlanSlot::Baseline(4), &all).unwrap();
+    let (b0, b4) = (p.task(a).unwrap().baseline_in(0).copied().unwrap(), p.task(a).unwrap().baseline_in(4).copied().unwrap());
+    assert_eq!((b4.start, b4.finish, b4.duration, b4.work, b4.cost), (b0.start, b0.finish, b0.duration, b0.work, b0.cost));
+    p.save_baseline_plan(PlanSlot::Baseline(4), PlanSlot::Interim(2), &all).unwrap();
+    assert_eq!(p.task(a).unwrap().interim_in(2).map(|i| (i.start, i.finish)), Some((b0.start, b0.finish)));
+}
+
+// Source: https://learn.microsoft.com/en-us/office/vba/api/project.pjsavebaselinefrom — the constants table
+// (with https://learn.microsoft.com/en-us/office/vba/api/project.application.baselinesave — "Parameters")
+// The Start1/Finish1 … Start10/Finish10 dates are listed as a source to copy from, and a baseline
+// is a target, so an interim plan's dates can be copied into a baseline. PlanCraft refuses this
+// because an interim plan has no duration, work or cost to put in the baseline.
+#[test]
+#[ignore = "parity gap: an interim plan can't be copied into a baseline"]
+fn interim_plans_can_be_copied_into_a_baseline() {
+    let mut p = project();
+    let a = task(&mut p, "A", 2 * DAY);
+    recalculate(&mut p);
+    let all = Scope::entire_project();
+    p.save_baseline_plan(PlanSlot::Scheduled, PlanSlot::Interim(1), &all).unwrap();
+    p.save_baseline_plan(PlanSlot::Interim(1), PlanSlot::Baseline(1), &all).unwrap();
+    let b = p.task(a).unwrap().baseline_in(1).copied().unwrap();
+    assert_eq!((b.start, b.finish), (dt(2026, 10, 19, 8), dt(2026, 10, 20, 17)));
+}
+
+// Source: https://learn.microsoft.com/en-us/office/vba/api/project.application.baselineclear — "Parameters"
+// Clearing works on all tasks or only the selected ones, for a baseline or for a Start/Finish
+// (interim) pair.
+#[test]
+fn clearing_a_numbered_baseline_or_interim_plan() {
+    let (mut p, s, a, d) = baselined_phase();
+    let all = Scope::entire_project();
+    p.set_baseline_in(2, &all).unwrap();
+    p.save_baseline_plan(PlanSlot::Scheduled, PlanSlot::Interim(5), &all).unwrap();
+    assert_eq!(p.clear_baseline_plan(PlanSlot::Baseline(2), &[a]).unwrap(), 1);
+    assert!(p.task(a).unwrap().baseline_in(2).is_none());
+    assert!(p.task(d).unwrap().baseline_in(2).is_some() && p.task(s).unwrap().baseline_in(2).is_some());
+    assert!(p.task(a).unwrap().baseline.is_some(), "Baseline is untouched");
+    assert_eq!(p.clear_baseline_plan(PlanSlot::Interim(5), &[]).unwrap(), 3);
+    assert!(p.tasks.iter().all(|t| t.interim.is_empty()));
+}
+
+// Source: https://support.microsoft.com/en-us/office/earned-value-method-task-field-4f2df39a-c696-4dd5-bd62-bb0ea26a4a33 — "Remarks"
+// Project Options let you pick which of the 11 baselines earned value is calculated from.
+#[test]
+fn earned_value_uses_the_chosen_baseline() {
+    let mut p = project();
+    let t = task(&mut p, "Build", 10 * DAY);
+    p.task_mut(t).unwrap().fixed_cost = 1000.0;
+    recalculate(&mut p);
+    p.set_baseline_in(0, &Scope::entire_project()).unwrap();
+    p.task_mut(t).unwrap().fixed_cost = 3000.0;
+    recalculate(&mut p);
+    p.set_baseline_in(3, &Scope::entire_project()).unwrap();
+    p.set_percent_complete(t, 50).unwrap();
+    recalculate(&mut p);
+    let at = dt(2026, 10, 30, 17);
+    let ev0 = plancraft_core::report::earned_value(&p, at).unwrap();
+    assert!((ev0.bcwp - 500.0).abs() < 1e-6, "BCWP against Baseline {}", ev0.bcwp);
+    p.set_earned_value_baseline(3).unwrap();
+    let ev3 = plancraft_core::report::earned_value(&p, at).unwrap();
+    assert_eq!(ev3.baseline, 3);
+    assert!((ev3.bcwp - 1500.0).abs() < 1e-6, "BCWP against Baseline3 {}", ev3.bcwp);
+    p.set_earned_value_baseline(5).unwrap();
+    assert!(plancraft_core::report::earned_value(&p, at).is_none(), "Baseline5 was never saved");
+}
+
+// ---------------------------------------------------------------------------
+// Split tasks
+// ---------------------------------------------------------------------------
+
+/// A (4 days, Mon 10/19 – Thu 10/22) followed by B (1 day).
+fn four_day_task() -> (Project, TaskId, TaskId) {
+    let mut p = project();
+    let a = task(&mut p, "A", 4 * DAY);
+    let b = task(&mut p, "B", DAY);
+    p.link(a.into(), b, LinkType::FS, Lag::None).unwrap();
+    recalculate(&mut p);
+    (p, a, b)
+}
+
+// Source: https://support.microsoft.com/en-us/project/split-a-task — "Split a task"
+// Splitting a task makes a later part of its work start later; a task can be split into as many
+// parts as needed. The work (the duration) is unchanged, so the finish moves out by the pauses.
+#[test]
+fn splitting_a_task_delays_the_rest_of_its_work() {
+    let (mut p, a, b) = four_day_task();
+    p.split_task(a, dt(2026, 10, 19, 17), dt(2026, 10, 21, 8)).unwrap();
+    p.split_task(a, dt(2026, 10, 22, 17), dt(2026, 10, 26, 8)).unwrap();
+    recalculate(&mut p);
+    let t = p.task(a).unwrap();
+    assert_eq!(t.duration, 4 * DAY);
+    assert_eq!(
+        t.sched.parts,
+        [
+            (dt(2026, 10, 19, 8), dt(2026, 10, 19, 17)),
+            (dt(2026, 10, 21, 8), dt(2026, 10, 22, 17)),
+            (dt(2026, 10, 26, 8), dt(2026, 10, 26, 17)),
+        ]
+    );
+    assert_eq!(start(&p, b), dt(2026, 10, 27, 8), "the successor follows the last part");
+}
+
+// Source: https://support.microsoft.com/en-us/project/split-a-task — "Split a task"
+// Dragging a part until it touches the other part rejoins them.
+#[test]
+fn rejoining_split_parts() {
+    let (mut p, a, _) = four_day_task();
+    p.split_task(a, dt(2026, 10, 20, 17), dt(2026, 10, 26, 8)).unwrap();
+    recalculate(&mut p);
+    p.set_split_length(a, 0, 0).unwrap();
+    recalculate(&mut p);
+    assert!(p.task(a).unwrap().sched.parts.is_empty());
+    assert_eq!(finish(&p, a), dt(2026, 10, 22, 17));
+}
+
+// Source: https://support.microsoft.com/en-us/project/split-a-task — "Move parts of a split task"
+// A later part can be moved on its own; moving the first part moves the whole task (its parts
+// keep their spacing).
+#[test]
+fn moving_parts_of_a_split_task() {
+    let (mut p, a, _) = four_day_task();
+    p.split_task(a, dt(2026, 10, 20, 17), dt(2026, 10, 22, 8)).unwrap();
+    recalculate(&mut p);
+    // The second part moves a day later: the pause grows from 1 to 2 days.
+    p.set_split_length(a, 0, 2 * DAY).unwrap();
+    recalculate(&mut p);
+    assert_eq!(p.task(a).unwrap().sched.parts[1], (dt(2026, 10, 23, 8), dt(2026, 10, 26, 17)));
+    // The whole task starts two days later.
+    p.task_mut(a).unwrap().constraint = Constraint { kind: ConstraintKind::Snet, date: Some(dt(2026, 10, 21, 8)) };
+    recalculate(&mut p);
+    assert_eq!(p.task(a).unwrap().sched.parts, [(dt(2026, 10, 21, 8), dt(2026, 10, 22, 17)), (dt(2026, 10, 27, 8), dt(2026, 10, 28, 17))]);
+}
+
+// Source: https://support.microsoft.com/en-us/project/split-a-task — "Change the duration of a split task"
+// The Duration field holds the work of all the parts together; one part can also be lengthened
+// or shortened on its own.
+#[test]
+fn changing_the_duration_of_a_split_task() {
+    let (mut p, a, _) = four_day_task();
+    p.split_task(a, dt(2026, 10, 20, 17), dt(2026, 10, 22, 8)).unwrap();
+    recalculate(&mut p);
+    p.set_part_duration(a, 0, 3 * DAY).unwrap();
+    recalculate(&mut p);
+    assert_eq!(duration(&p, a), 5 * DAY);
+    assert_eq!(p.task(a).unwrap().sched.parts, [(dt(2026, 10, 19, 8), dt(2026, 10, 21, 17)), (dt(2026, 10, 23, 8), dt(2026, 10, 26, 17))]);
+    p.set_duration(a, 3 * DAY, false).unwrap();
+    recalculate(&mut p);
+    assert_eq!(finish(&p, a), dt(2026, 10, 21, 17), "all 3 days of work fit in the first part");
+    assert!(p.task(a).unwrap().sched.parts.is_empty(), "the pause past the work has no effect");
+}
+
+// Source: https://learn.microsoft.com/en-us/office/vba/api/project.task.split — "Parameters"
+// A split whose end is on or before its start is not created.
+#[test]
+fn a_split_must_end_after_it_starts() {
+    let (mut p, a, _) = four_day_task();
+    assert!(p.split_task(a, dt(2026, 10, 20, 17), dt(2026, 10, 20, 17)).is_err());
+    assert!(p.split_task(a, dt(2026, 10, 20, 17), dt(2026, 10, 20, 9)).is_err());
+    assert!(p.task(a).unwrap().gaps.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Recurring tasks
+// ---------------------------------------------------------------------------
+
+fn weekly(days: u8, interval: u16, end: plancraft_core::recurring::RecurEnd, duration: Minutes) -> plancraft_core::recurring::Recurrence {
+    plancraft_core::recurring::Recurrence {
+        pattern: plancraft_core::recurring::Pattern::Weekly { interval, days },
+        start: d(2026, 10, 19),
+        end,
+        duration,
+        calendar: None,
+        ignore_resource_calendars: false,
+    }
+}
+
+fn occurrences(p: &Project, id: TaskId) -> Vec<&Task> {
+    let i = p.task_index(id).unwrap();
+    p.tasks[p.descendants_range(i)].iter().collect()
+}
+
+// Source: https://support.microsoft.com/en-us/project/create-recurring-tasks — "Create a recurring task"
+// A task can repeat every Tuesday and Thursday, or every three weeks, with each occurrence
+// lasting the duration given; the range ends after a number of occurrences or by a date.
+#[test]
+fn recurring_tasks_follow_their_pattern() {
+    use plancraft_core::recurring::RecurEnd;
+    let mut p = project();
+    let tt = p.add_recurring_task("Stand-up", weekly(0b1010, 1, RecurEnd::After(4), HOUR), None).unwrap();
+    let every3 = p.add_recurring_task("Review", weekly(0b1, 3, RecurEnd::By(d(2026, 12, 1)), 2 * HOUR), None).unwrap();
+    recalculate(&mut p);
+    let starts: Vec<_> = occurrences(&p, tt).iter().map(|t| t.sched.start.unwrap()).collect();
+    assert_eq!(starts, [dt(2026, 10, 20, 8), dt(2026, 10, 22, 8), dt(2026, 10, 27, 8), dt(2026, 10, 29, 8)]);
+    assert!(occurrences(&p, tt).iter().all(|t| t.duration == HOUR));
+    assert_eq!(occurrences(&p, tt)[0].name, "Stand-up 1");
+    let starts: Vec<_> = occurrences(&p, every3).iter().map(|t| t.sched.start.unwrap()).collect();
+    assert_eq!(starts, [dt(2026, 10, 19, 8), dt(2026, 11, 9, 8), dt(2026, 11, 30, 8)]);
+    assert!(p.task(tt).unwrap().sched.is_summary);
+}
+
+// Source: https://support.microsoft.com/en-us/project/create-recurring-tasks — "Recurring reminders"
+// A recurring task with a duration of zero is a recurring milestone.
+#[test]
+fn a_zero_duration_recurring_task_is_a_milestone() {
+    use plancraft_core::recurring::RecurEnd;
+    let mut p = project();
+    let r = p.add_recurring_task("Report due", weekly(0b10000, 1, RecurEnd::After(3), 0), None).unwrap();
+    recalculate(&mut p);
+    assert!(occurrences(&p, r).iter().all(|t| t.is_milestone()));
+}
+
+// Source: https://support.microsoft.com/en-us/project/create-recurring-tasks — "Assign resources to recurring tasks"
+// Resources assigned to the recurring (summary) task are assigned to every occurrence.
+#[test]
+fn resources_on_a_recurring_task_work_every_occurrence() {
+    use plancraft_core::recurring::RecurEnd;
+    let mut p = project();
+    let r = p.add_recurring_task("Stand-up", weekly(0b11111, 1, RecurEnd::After(5), HOUR), None).unwrap();
+    let ana = p.add_resource("Ana");
+    p.assign(r, ana, Some(1.0), None).unwrap();
+    recalculate(&mut p);
+    assert!(occurrences(&p, r).iter().all(|t| p.assignments_for_task(t.id).any(|a| a.resource == ana)));
+    assert_eq!(p.assignments_for_task(r).count(), 0, "not on the summary row itself");
+}
+
+// Source: https://support.microsoft.com/en-us/project/create-recurring-tasks — "Level recurring tasks"
+// Recurring tasks get the highest leveling priority, so leveling never delays or splits them.
+#[test]
+fn leveling_never_delays_recurring_tasks() {
+    use plancraft_core::recurring::RecurEnd;
+    let mut p = project();
+    let ana = p.add_resource("Ana");
+    let other = task(&mut p, "Other", DAY);
+    p.task_mut(other).unwrap().priority = 1000;
+    p.assign(other, ana, Some(1.0), None).unwrap();
+    let r = p.add_recurring_task("Workshop", weekly(0b1, 1, RecurEnd::After(1), DAY), None).unwrap();
+    p.task_mut(r).unwrap().priority = 0;
+    p.assign(r, ana, Some(1.0), None).unwrap();
+    plancraft_core::leveling::level_resources(&mut p, &Default::default());
+    recalculate(&mut p);
+    assert_eq!(occurrences(&p, r)[0].sched.start, Some(dt(2026, 10, 19, 8)));
+    assert_eq!(start(&p, other), dt(2026, 10, 20, 8), "the other task waits, whatever its priority");
+}
+
+// Source: https://support.microsoft.com/en-us/project/create-recurring-tasks — "Create a recurring task" (calendar)
+// A recurring task can follow its own calendar, e.g. a night shift, instead of the project's.
+#[test]
+fn a_recurring_task_can_use_its_own_calendar() {
+    use plancraft_core::recurring::RecurEnd;
+    let mut p = project();
+    let night = p.calendars.iter().find(|c| c.name == "Night Shift").map(|c| c.id).unwrap_or_else(|| {
+        let c = plancraft_core::calendar::Calendar::night_shift(CalendarId(77));
+        p.calendars.push(c);
+        CalendarId(77)
+    });
+    let rec = plancraft_core::recurring::Recurrence { calendar: Some(night), ..weekly(0b1, 1, RecurEnd::After(2), HOUR) };
+    let r = p.add_recurring_task("Night check", rec, None).unwrap();
+    recalculate(&mut p);
+    let occ = occurrences(&p, r);
+    assert!(occ.iter().all(|t| t.calendar == Some(night)));
+    assert_eq!(occ[0].sched.start, Some(dt(2026, 10, 19, 23)), "the night shift starts at 23:00 on Monday");
+}
+
+// Source: https://support.microsoft.com/en-us/project/recurring-task-field — "Description"
+// The Recurring field says whether a task is part of a series of recurring tasks.
+#[test]
+fn the_recurring_field_marks_the_series() {
+    use plancraft_core::recurring::RecurEnd;
+    let mut p = project();
+    let plain = task(&mut p, "Plain", DAY);
+    let r = p.add_recurring_task("Stand-up", weekly(0b1, 1, RecurEnd::After(2), HOUR), None).unwrap();
+    let rows: Vec<usize> = (0..p.tasks.len()).collect();
+    let flags: Vec<bool> = rows.iter().map(|&i| p.is_recurring(i)).collect();
+    assert_eq!(flags, [false, true, true, true]);
+    assert!(!p.is_recurring(p.task_index(plain).unwrap()) && p.is_recurring(p.task_index(r).unwrap()));
+}
+
+// ---------------------------------------------------------------------------
+// Task Board
+// ---------------------------------------------------------------------------
+
+fn board_names(p: &Project) -> Vec<String> {
+    p.board_columns.iter().map(|c| c.name.clone()).collect()
+}
+
+fn column_of(p: &Project, id: TaskId) -> String {
+    let col = p.board_column_of(p.task_index(id).unwrap()).unwrap();
+    p.board_column(col).unwrap().name.clone()
+}
+
+// Source: https://support.microsoft.com/en-us/project/use-task-boards-in-microsoft-project-online-desktop-client — "Add tasks to your projects"
+// Every new task starts in the Not Started column. (PlanCraft's board also starts with Next up,
+// In progress and Done, the columns the page's "Move tasks across the board" gives a sprint
+// board.)
+#[test]
+fn new_tasks_start_in_not_started() {
+    let mut p = project();
+    let a = task(&mut p, "A", DAY);
+    assert_eq!(board_names(&p), ["Not Started", "Next up", "In progress", "Done"]);
+    assert_eq!(column_of(&p, a), "Not Started");
+}
+
+// Source: https://support.microsoft.com/en-us/project/use-task-boards-in-microsoft-project-online-desktop-client — "Move tasks across the board"
+// A card is moved to the column matching its status, which is the task's Board Status; a column
+// can be renamed, and a new one is added to the right of the last.
+#[test]
+fn moving_cards_and_changing_columns() {
+    let mut p = project();
+    let a = task(&mut p, "A", DAY);
+    let next = p.find_board_column("Next up").unwrap();
+    p.set_board_status(&[a], next).unwrap();
+    assert_eq!(column_of(&p, a), "Next up");
+    assert_eq!(p.task(a).unwrap().board_status, Some(next));
+    p.rename_board_column(next, "Ready").unwrap();
+    assert_eq!(column_of(&p, a), "Ready");
+    p.add_board_column("Blocked", None, None).unwrap();
+    assert_eq!(board_names(&p).last().map(String::as_str), Some("Blocked"));
+}
+
+// Source: https://support.microsoft.com/en-us/project/use-task-boards-in-microsoft-project-online-desktop-client — "Manage your agile tasks in the Gantt chart"
+// Show on Board is Yes by default; setting it to No takes the task off the board views without
+// removing it from the plan.
+#[test]
+fn show_on_board_hides_a_card() {
+    let mut p = project();
+    let a = task(&mut p, "A", DAY);
+    assert!(p.task(a).unwrap().show_on_board);
+    p.set_show_on_board(&[a], false).unwrap();
+    assert!(p.board().iter().all(|(_, rows)| rows.is_empty()));
+    assert!(p.task(a).is_some());
+}
+
+// Source: https://support.microsoft.com/en-us/office/what-s-new-in-project-111bcaf9-bc27-4c15-80e6-85e726307520 — "Set percent complete from a task board"
+// A column's Set % Complete value updates the % complete of a task moved into it, and the Gantt
+// Chart shows the new value.
+#[test]
+fn a_column_can_set_percent_complete() {
+    let mut p = project();
+    let a = task(&mut p, "A", 2 * DAY);
+    let review = p.add_board_column("Review", None, Some(75)).unwrap();
+    p.set_board_status(&[a], review).unwrap();
+    recalculate(&mut p);
+    assert_eq!(p.task(a).unwrap().percent_complete, 75);
+    assert_eq!(p.task(a).unwrap().sched.percent_complete, 75.0);
+    // A column without one leaves progress alone.
+    let next = p.find_board_column("Next up").unwrap();
+    p.set_board_status(&[a], next).unwrap();
+    assert_eq!(p.task(a).unwrap().percent_complete, 75);
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/boardcolumn-element?view=project-client-odc — "Occurrences"
+// A project has between 1 and 100 board columns.
+#[test]
+fn a_board_has_one_to_a_hundred_columns() {
+    let mut p = project();
+    while p.board_columns.len() < 100 {
+        let n = p.board_columns.len();
+        p.add_board_column(&format!("Column {n}"), None, None).unwrap();
+    }
+    assert!(p.add_board_column("One more", None, None).is_err());
+    while p.board_columns.len() > 1 {
+        let id = p.board_columns[0].id;
+        p.delete_board_column(id).unwrap();
+    }
+    assert!(p.delete_board_column(p.board_columns[0].id).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Network Diagram layout
+// ---------------------------------------------------------------------------
+
+fn network(p: &Project, critical_first: bool) -> plancraft_core::network::Diagram {
+    use plancraft_core::network::{NetworkOptions, boxes_for, layout};
+    let shown = vec![true; p.tasks.len()];
+    layout(p, &boxes_for(p, &shown, &Default::default()), NetworkOptions { critical_first, ids_only: false })
+}
+
+fn cell(d: &plancraft_core::network::Diagram, p: &Project, id: TaskId) -> (u32, u32) {
+    let n = &d.nodes[d.node_of(p.task_index(id).unwrap()).unwrap()];
+    (n.col, n.row)
+}
+
+// Source: https://support.microsoft.com/en-us/office/layout-dialog-box-aab7e026-13f6-428e-a20a-0825865537cc — "Box Layout" (Top Down From Left)
+// The default arrangement starts the first path at the upper left and runs it across; each further
+// path starts on a new row below.
+#[test]
+fn network_diagram_runs_each_path_along_its_own_row() {
+    let mut p = project();
+    let a = task(&mut p, "A", DAY);
+    let b = task(&mut p, "B", DAY);
+    let c = task(&mut p, "C", DAY);
+    let other = task(&mut p, "Other start", DAY);
+    let d2 = task(&mut p, "D", DAY);
+    p.link_chain(&[a, b, c]).unwrap();
+    p.link_chain(&[other, d2]).unwrap();
+    recalculate(&mut p);
+    let d = network(&p, false);
+    assert_eq!([cell(&d, &p, a), cell(&d, &p, b), cell(&d, &p, c)], [(0, 0), (1, 0), (2, 0)]);
+    assert_eq!([cell(&d, &p, other), cell(&d, &p, d2)], [(0, 1), (1, 1)]);
+}
+
+// Source: https://support.microsoft.com/en-us/office/layout-dialog-box-aab7e026-13f6-428e-a20a-0825865537cc — "Box Layout" (Top Down - Critical First)
+// With "Critical First" the critical path is laid out first, from the upper left; other paths go
+// on the rows below it.
+#[test]
+fn network_diagram_critical_first_puts_the_critical_path_on_top() {
+    let mut p = project();
+    let side = task(&mut p, "Side", DAY);
+    let main = task(&mut p, "Main", 5 * DAY);
+    let end = task(&mut p, "End", DAY);
+    p.link(side.into(), end, LinkType::FS, Lag::None).unwrap();
+    p.link(main.into(), end, LinkType::FS, Lag::None).unwrap();
+    recalculate(&mut p);
+    let d = network(&p, true);
+    assert_eq!([cell(&d, &p, main), cell(&d, &p, end)], [(0, 0), (1, 0)]);
+    assert_eq!(cell(&d, &p, side), (0, 1));
+}
+
+// Source: https://support.microsoft.com/en-us/office/layout-dialog-box-aab7e026-13f6-428e-a20a-0825865537cc — "Link style" (Rectilinear)
+// Right-angled link lines leave a predecessor's box on its right side and go into the successor's
+// box on its left side.
+#[test]
+fn network_diagram_links_leave_on_the_right_and_enter_on_the_left() {
+    let mut p = project();
+    let a = task(&mut p, "A", DAY);
+    let b = task(&mut p, "B", DAY);
+    let c = task(&mut p, "C", DAY);
+    p.link(a.into(), b, LinkType::FS, Lag::None).unwrap();
+    p.link(b.into(), c, LinkType::FS, Lag::None).unwrap();
+    p.link(a.into(), c, LinkType::SS, Lag::None).unwrap();
+    recalculate(&mut p);
+    let d = network(&p, false);
+    assert!(d.links.iter().any(|l| d.route(l).len() == 6), "A -> C skips B's column");
+    for l in &d.links {
+        let (from, to) = (d.rect(l.from).unwrap(), d.rect(l.to).unwrap());
+        let pts = d.route(l);
+        let (first, last) = (pts[0], pts[pts.len() - 1]);
+        assert_eq!(first, (from.right(), from.mid_y()));
+        assert_eq!(last, (to.x, to.mid_y()));
+        // Right angles only.
+        assert!(pts.windows(2).all(|w| w[0].0 == w[1].0 || w[0].1 == w[1].1), "{pts:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Microsoft Project XML (MSPDI), from the published Project XML Data Interchange Schema Reference
+// on learn.microsoft.com. Each test reads a small hand-written file.
+// ---------------------------------------------------------------------------
+
+/// An MSPDI file starting Monday 2026-10-19 with the given tasks (and optional extra elements
+/// after them).
+fn mspdi(tasks: &str, extra: &str) -> Project {
+    let xml = format!(
+        "<Project><StartDate>2026-10-19T08:00:00</StartDate><MinutesPerDay>480</MinutesPerDay><Tasks>{tasks}</Tasks>{extra}</Project>"
+    );
+    let (mut p, notes) = plancraft_core::mspdi::from_xml(&xml, "MSPDI").unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+    recalculate(&mut p);
+    p
+}
+
+fn xml_task(uid: u32, name: &str, duration: &str, inner: &str) -> String {
+    format!("<Task><UID>{uid}</UID><Name>{name}</Name><OutlineLevel>1</OutlineLevel><Duration>{duration}</Duration>{inner}</Task>")
+}
+
+fn link_xml(pred: u32, kind: u32, lag: i64, format: u32) -> String {
+    format!(
+        "<PredecessorLink><PredecessorUID>{pred}</PredecessorUID><Type>{kind}</Type><LinkLag>{lag}</LinkLag><LagFormat>{format}</LagFormat></PredecessorLink>"
+    )
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-tasks-element — "Tasks Schema" (PredecessorLink Type)
+// A link's type is coded 0 for finish-to-finish, 1 finish-to-start, 2 start-to-finish and 3
+// start-to-start.
+#[test]
+fn mspdi_link_type_codes() {
+    let mut tasks = xml_task(1, "Pred", "PT8H0M0S", "");
+    for (uid, code) in [(2u32, 0u32), (3, 1), (4, 2), (5, 3)] {
+        tasks += &xml_task(uid, &format!("S{code}"), "PT8H0M0S", &link_xml(1, code, 0, 7));
+    }
+    let p = mspdi(&tasks, "");
+    let kinds: Vec<LinkType> = p.tasks[1..].iter().map(|t| t.predecessors[0].kind).collect();
+    assert_eq!(kinds, [LinkType::FF, LinkType::FS, LinkType::SF, LinkType::SS]);
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/linklag-element — "LinkLag Element"
+// LinkLag holds the lag in tenths of a minute: 4800 is one 8-hour working day.
+#[test]
+fn mspdi_link_lag_is_in_tenths_of_a_minute() {
+    let tasks = xml_task(1, "A", "PT8H0M0S", "") + &xml_task(2, "B", "PT8H0M0S", &link_xml(1, 1, 4800, 7));
+    let p = mspdi(&tasks, "");
+    assert_eq!(p.tasks[1].predecessors[0].lag, Lag::Working(DAY));
+    // A finishes Monday 17:00; one day of lag starts B on Wednesday.
+    assert_eq!(p.tasks[1].sched.start, Some(dt(2026, 10, 21, 8)));
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-tasks-element — "Tasks Schema" (ConstraintType)
+// Constraint codes: 0 as soon as possible, 1 as late as possible, 2 must start on, 3 must finish
+// on, 4 start no earlier than, 5 start no later than, 6 finish no earlier than, 7 finish no later than.
+#[test]
+fn mspdi_constraint_type_codes() {
+    let date = "<ConstraintDate>2026-10-21T08:00:00</ConstraintDate>";
+    let mut tasks = String::new();
+    for code in 0..8u32 {
+        tasks += &xml_task(code + 1, &format!("C{code}"), "PT8H0M0S", &format!("<ConstraintType>{code}</ConstraintType>{date}"));
+    }
+    let p = mspdi(&tasks, "");
+    let kinds: Vec<ConstraintKind> = p.tasks.iter().map(|t| t.constraint.kind).collect();
+    use ConstraintKind::*;
+    assert_eq!(kinds, [Asap, Alap, Mso, Mfo, Snet, Snlt, Fnet, Fnlt]);
+    let snet = &p.tasks[4];
+    assert_eq!(snet.sched.start, Some(dt(2026, 10, 21, 8)));
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-tasks-element — "Tasks Schema" (Type, DurationFormat)
+// Task types: 0 fixed units, 1 fixed duration, 2 fixed work. A duration format code with a
+// question mark (39 is "d?") marks the duration as estimated.
+#[test]
+fn mspdi_task_type_and_estimated_duration_codes() {
+    let tasks = xml_task(1, "U", "PT8H0M0S", "<Type>0</Type><DurationFormat>7</DurationFormat>")
+        + &xml_task(2, "D", "PT8H0M0S", "<Type>1</Type><DurationFormat>39</DurationFormat>")
+        + &xml_task(3, "W", "PT8H0M0S", "<Type>2</Type>");
+    let p = mspdi(&tasks, "");
+    let types: Vec<TaskType> = p.tasks.iter().map(|t| t.task_type).collect();
+    assert_eq!(types, [TaskType::FixedUnits, TaskType::FixedDuration, TaskType::FixedWork]);
+    assert_eq!(p.tasks.iter().map(|t| t.estimated).collect::<Vec<_>>(), [false, true, false]);
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/levelingdelay-element — "Remarks"
+// A leveling delay is given in the unit of its LevelingDelayFormat: 3 with format 7 is 3 days.
+#[test]
+fn mspdi_leveling_delay_uses_its_format() {
+    let p = mspdi(&xml_task(1, "Delayed", "PT8H0M0S", "<LevelingDelay>3</LevelingDelay><LevelingDelayFormat>7</LevelingDelayFormat>"), "");
+    assert_eq!(p.tasks[0].leveling_delay, 3 * DAY);
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-calendars-element — "Calendars Schema" (WeekDay, Exception)
+// DayType 1–7 is Sunday–Saturday and DayWorking says whether that day is worked; an exception
+// of Type 6 repeats weekly on the DaysOfWeek bits (1 Sunday, 2 Monday, 4 Tuesday, 8 Wednesday …).
+#[test]
+fn mspdi_calendar_day_types_and_weekly_exceptions() {
+    let cal = "<CalendarUID>1</CalendarUID><Calendars><Calendar><UID>1</UID><Name>Six days</Name><IsBaseCalendar>1</IsBaseCalendar><WeekDays>\
+        <WeekDay><DayType>7</DayType><DayWorking>1</DayWorking><WorkingTimes><WorkingTime><FromTime>09:00:00</FromTime><ToTime>13:00:00</ToTime></WorkingTime></WorkingTimes></WeekDay>\
+        <WeekDay><DayType>1</DayType><DayWorking>0</DayWorking></WeekDay></WeekDays>\
+        <Exceptions><Exception><EnteredByOccurrences>1</EnteredByOccurrences><TimePeriod><FromDate>2026-10-19T00:00:00</FromDate><ToDate>2026-12-31T23:59:00</ToDate></TimePeriod>\
+        <Occurrences>2</Occurrences><Name>Tuesdays off</Name><Type>6</Type><Period>1</Period><DaysOfWeek>4</DaysOfWeek><DayWorking>0</DayWorking></Exception></Exceptions>\
+        </Calendar></Calendars>";
+    // The file's elements come in the schema's order: calendars before tasks.
+    let xml = format!(
+        "<Project><StartDate>2026-10-19T08:00:00</StartDate>{cal}<Tasks>{}</Tasks></Project>",
+        xml_task(1, "Three days", "PT24H0M0S", "")
+    );
+    let (mut p, notes) = plancraft_core::mspdi::from_xml(&xml, "MSPDI").unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+    recalculate(&mut p);
+    let c = p.base_calendar();
+    assert_eq!(c.week.saturday, vec![TimeRange::hours(9, 13)]);
+    assert!(c.week.sunday.is_empty());
+    let off: Vec<NaiveDate> = c.exceptions.iter().map(|e| e.start).collect();
+    assert_eq!(off, [d(2026, 10, 20), d(2026, 10, 27)]);
+    // Monday, then Tuesday is off: Wednesday and Thursday finish the three days.
+    assert_eq!(p.tasks[0].sched.finish, Some(dt(2026, 10, 22, 17)));
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-resources-element — "Resources Schema" (Type, IsCostResource, AvailableUnits)
+// Resource Type 0 is a material resource and 1 a work resource; IsCostResource marks a cost
+// resource; an availability period's AvailableUnits is a percentage.
+#[test]
+fn mspdi_resource_types_and_availability() {
+    let res = "<Resources>\
+        <Resource><UID>1</UID><Name>Steel</Name><Type>0</Type><MaterialLabel>t</MaterialLabel></Resource>\
+        <Resource><UID>2</UID><Name>Ana</Name><Type>1</Type><MaxUnits>1</MaxUnits><AvailabilityPeriods><AvailabilityPeriod>\
+          <AvailableFrom>2026-11-01T08:00:00</AvailableFrom><AvailableTo>2026-11-30T17:00:00</AvailableTo><AvailableUnits>50</AvailableUnits></AvailabilityPeriod></AvailabilityPeriods></Resource>\
+        <Resource><UID>3</UID><Name>Travel</Name><Type>1</Type><IsCostResource>1</IsCostResource></Resource></Resources>";
+    let p = mspdi("", res);
+    let kinds: Vec<ResourceType> = p.resources.iter().map(|r| r.kind).collect();
+    assert_eq!(kinds, [ResourceType::Material, ResourceType::Work, ResourceType::Cost]);
+    assert_eq!(p.resources[1].units_on(d(2026, 11, 10)), 0.5);
+    assert_eq!(p.resources[1].units_on(d(2026, 12, 10)), 1.0);
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-assignments-element — "Assignments Schema" (Units, WorkContour)
+// An assignment links a task and a resource by their UIDs; WorkContour 0 is flat, 1 back loaded,
+// 2 front loaded and 6 bell.
+#[test]
+fn mspdi_assignment_contour_codes() {
+    let tasks = (1..=4u32).map(|u| xml_task(u, &format!("T{u}"), "PT16H0M0S", "")).collect::<String>();
+    let mut asg = String::from("<Resources><Resource><UID>9</UID><Name>Ana</Name><Type>1</Type></Resource></Resources><Assignments>");
+    for (uid, contour) in [(1u32, 0u32), (2, 1), (3, 2), (4, 6)] {
+        asg += &format!(
+            "<Assignment><UID>{uid}</UID><TaskUID>{uid}</TaskUID><ResourceUID>9</ResourceUID><Units>1</Units><Work>PT16H0M0S</Work><WorkContour>{contour}</WorkContour></Assignment>"
+        );
+    }
+    asg += "</Assignments>";
+    let p = mspdi(&tasks, &asg);
+    let contours: Vec<WorkContour> = p.assignments.iter().map(|a| a.contour).collect();
+    assert_eq!(contours, [WorkContour::Flat, WorkContour::BackLoaded, WorkContour::FrontLoaded, WorkContour::Bell]);
+    assert!(p.assignments.iter().all(|a| a.work == 2 * DAY && a.units == 1.0));
+}
+
+// Source: https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-extendedattributes-element — "ExtendedAttributes Schema" (FieldID, CFType, Alias)
+// Source: https://learn.microsoft.com/en-us/office/vba/api/project.pjfield — the constants table (pjTaskText1, pjTaskNumber1)
+// A custom field is defined by the PjField id of the field it uses (Text1 is 188743731, Number1
+// 188743767), its type (CFType 7 text, 5 number) and its alias; tasks hold values by field id.
+#[test]
+fn mspdi_custom_fields_by_field_id() {
+    let defs = "<ExtendedAttributes>\
+        <ExtendedAttribute><FieldID>188743731</FieldID><FieldName>Text1</FieldName><CFType>7</CFType><Alias>Phase</Alias></ExtendedAttribute>\
+        <ExtendedAttribute><FieldID>188743767</FieldID><FieldName>Number1</FieldName><CFType>5</CFType><Alias>Risk</Alias></ExtendedAttribute>\
+        </ExtendedAttributes>";
+    let values = "<ExtendedAttribute><FieldID>188743731</FieldID><Value>Design</Value></ExtendedAttribute>\
+        <ExtendedAttribute><FieldID>188743767</FieldID><Value>4.5</Value></ExtendedAttribute>";
+    let xml = format!(
+        "<Project><StartDate>2026-10-19T08:00:00</StartDate>{defs}<Tasks>{}</Tasks></Project>",
+        xml_task(1, "A", "PT8H0M0S", values)
+    );
+    let (p, notes) = plancraft_core::mspdi::from_xml(&xml, "MSPDI").unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+    let field = |name: &str| p.custom_fields.iter().find(|f| f.name == name).unwrap();
+    assert_eq!(field("Phase").kind, CustomFieldKind::Text);
+    assert_eq!(field("Risk").kind, CustomFieldKind::Number);
+    assert_eq!(p.tasks[0].custom.get(&field("Phase").id), Some(&CustomValue::Text("Design".into())));
+    assert_eq!(p.tasks[0].custom.get(&field("Risk").id), Some(&CustomValue::Number(4.5)));
+}

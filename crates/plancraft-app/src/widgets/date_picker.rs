@@ -7,7 +7,7 @@ use crate::{format, theme};
 
 /// Shows a calendar button and returns a chosen date.
 pub fn picker_button(ui: &mut Ui, id: Id, selected: Option<NaiveDate>) -> (Option<NaiveDate>, bool) {
-    let response = ui.push_id(id, |ui| ui.small_button("▦")).inner.on_hover_text(crate::tr("Choose date"));
+    let response = ui.push_id(id, |ui| ui.small_button("📅")).inner.on_hover_text(crate::tr("Choose date"));
     let mut picked = None;
     let mut is_open = false;
     egui::Popup::menu(&response).show(|ui| {

@@ -2,12 +2,13 @@
 
 use plancraft_core::workspace::Document;
 
-use crate::columns::{self, TaskCol};
+use crate::columns::TaskCol;
 use crate::edit::EditExt;
+use crate::fields::Field;
 use crate::state::{ToastKind, UiState};
 use crate::widgets::{grid::GridSelection, tsv};
 
-pub(super) fn paste(doc: &mut Document, st: &mut UiState, rows: &[usize], cols: &[TaskCol], row: usize, col: usize, text: &str) {
+pub(super) fn paste(doc: &mut Document, st: &mut UiState, rows: &[super::Row], cols: &[Field], row: usize, col: usize, text: &str) {
     let result = paste_inner(doc, st, rows, cols, row, col, text);
     match result {
         Ok((updated, skipped, height, width)) => {
@@ -30,8 +31,8 @@ pub(super) fn paste(doc: &mut Document, st: &mut UiState, rows: &[usize], cols: 
 fn paste_inner(
     doc: &mut Document,
     st: &UiState,
-    rows: &[usize],
-    cols: &[TaskCol],
+    rows: &[super::Row],
+    cols: &[Field],
     row: usize,
     col: usize,
     text: &str,
@@ -63,7 +64,7 @@ fn paste_inner(
             let value = data.get(dr % source_h).and_then(|r| r.get(dc % source_w));
             let task = super::task_at(&doc.project, rows, target_row);
             if let (Some(value), Some(task), Some(&column)) = (value, task, cols.get(target_col))
-                && columns::can_edit(column, &doc.project, task.id)
+                && column.can_edit(&doc.project, task.id)
             {
                 targets.push((task.id, column, value.clone(), target_row, target_col));
             } else {
@@ -79,11 +80,19 @@ fn paste_inner(
     let updated = doc.edit_msg(crate::tr("Paste Cells"), |project| {
         let mut updated = 0usize;
         for (id, column, value, r, c) in targets {
-            if !columns::can_edit(column, project, id) {
+            if !column.can_edit(project, id) {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
-            columns::commit(column, project, id, &value)
+            if column == Field::Builtin(TaskCol::Notes) {
+                if let Some(task) = project.task_mut(id) {
+                    task.notes = value;
+                }
+                updated = updated.saturating_add(1);
+                continue;
+            }
+            column
+                .commit(project, id, &value)
                 .map_err(|error| crate::tr_dyn(&format!("Row {}, column {}: {}", r.saturating_add(1), c.saturating_add(1), error)))?;
             updated = updated.saturating_add(1);
         }
@@ -116,8 +125,21 @@ mod tests {
             vec!["Manual edited".into(), "2026-11-02".into(), "2026-11-03".into(), notes.into()],
         ]);
         let original_constraint = doc.project.task(auto).unwrap().constraint;
-        let result =
-            paste_inner(doc, &st, &[0, 1], &[TaskCol::Name, TaskCol::Start, TaskCol::Finish, TaskCol::Notes], 0, 0, &text).unwrap();
+        let result = paste_inner(
+            doc,
+            &st,
+            &[crate::views::Row::Task(0), crate::views::Row::Task(1)],
+            &[
+                Field::Builtin(TaskCol::Name),
+                Field::Builtin(TaskCol::Start),
+                Field::Builtin(TaskCol::Finish),
+                Field::Builtin(TaskCol::Notes),
+            ],
+            0,
+            0,
+            &text,
+        )
+        .unwrap();
         assert_eq!((result.0, result.1), (6, 2));
         assert_eq!(doc.project.tasks.len(), 2);
         assert_eq!(doc.project.task(auto).unwrap().constraint, original_constraint);
@@ -141,10 +163,28 @@ mod tests {
         let mut st = UiState::default();
         st.task_grid.select_cell(0, 0, false);
         st.task_grid.select_cell(1, 0, true);
-        let protected = paste_inner(doc, &st, &[0, 1], &[TaskCol::Start], 0, 0, "not even a date").unwrap();
+        let protected = paste_inner(
+            doc,
+            &st,
+            &[crate::views::Row::Task(0), crate::views::Row::Task(1)],
+            &[Field::Builtin(TaskCol::Start)],
+            0,
+            0,
+            "not even a date",
+        )
+        .unwrap();
         assert_eq!((protected.0, protected.1), (0, 2));
         assert!(!doc.can_undo());
-        let fill = paste_inner(doc, &st, &[0, 1], &[TaskCol::Name], 0, 0, "Bulk").unwrap();
+        let fill = paste_inner(
+            doc,
+            &st,
+            &[crate::views::Row::Task(0), crate::views::Row::Task(1)],
+            &[Field::Builtin(TaskCol::Name)],
+            0,
+            0,
+            "Bulk",
+        )
+        .unwrap();
         assert_eq!(fill.0, 2);
         assert!(doc.project.tasks.iter().all(|t| t.name == "Bulk"));
         assert_eq!(doc.project.tasks.len(), 2);

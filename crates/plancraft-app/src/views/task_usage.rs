@@ -54,9 +54,10 @@ pub fn show(ui: &mut Ui, rect: Rect, doc: &mut Document, st: &mut UiState, out: 
         periods.binary_search(&b).ok()
     };
 
-    let task_rows = super::visible_rows_ungrouped(p, st);
+    let task_rows = super::outline_rows(p, st);
     let mut rows = Vec::new();
-    for &i in &task_rows {
+    // Group headers are left out here: the usage grid lists tasks and their assignments.
+    for i in task_rows.iter().filter_map(super::Row::task) {
         let Some(t) = p.tasks.get(i) else { continue };
         rows.push(Row::Task(i, t));
         for a in p.assignments_for_task(t.id) {

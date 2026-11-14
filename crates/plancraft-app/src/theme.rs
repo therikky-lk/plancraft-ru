@@ -26,6 +26,7 @@ pub struct Palette {
     pub GOLD: Color32,
     // Surfaces & text
     pub TEXT: Color32,
+    pub TEXT_ON_ACCENT: Color32,
     pub TEXT_WEAK: Color32,
     pub BG: Color32,
     pub PANEL_BG: Color32,
@@ -51,6 +52,8 @@ pub struct Palette {
     pub BAR_SUMMARY: Color32,
     pub BAR_MANUAL: Color32,
     pub BAR_BASELINE: Color32,
+    /// Bars of Baseline, Baseline1 … Baseline10 in the Multiple Baselines Gantt.
+    pub BASELINE_SERIES: [Color32; 11],
     pub BAR_SLACK: Color32,
     pub BAR_INACTIVE: Color32,
     pub BAR_COMPLETE: Color32,
@@ -85,6 +88,7 @@ pub const LIGHT: Palette = Palette {
     TITLE_BAR: rgb(0x22, 0x5A, 0x26),
     GOLD: rgb(0xF2, 0xB1, 0x1C),
     TEXT: rgb(0x26, 0x26, 0x26),
+    TEXT_ON_ACCENT: rgb(0xFF, 0xFF, 0xFF),
     TEXT_WEAK: rgb(0x5C, 0x5C, 0x5C),
     BG: rgb(0xFF, 0xFF, 0xFF),
     PANEL_BG: rgb(0xF3, 0xF3, 0xF3),
@@ -109,6 +113,19 @@ pub const LIGHT: Palette = Palette {
     BAR_SUMMARY: rgb(0x26, 0x26, 0x26),
     BAR_MANUAL: rgb(0x9E, 0xC1, 0xEA),
     BAR_BASELINE: rgb(0xA6, 0xA6, 0xA6),
+    BASELINE_SERIES: [
+        rgb(0x8A, 0x90, 0x9C),
+        rgb(0x1F, 0x8A, 0x8A),
+        rgb(0xC8, 0x8A, 0x12),
+        rgb(0x7B, 0x4F, 0xB8),
+        rgb(0x3C, 0x8D, 0x3A),
+        rgb(0xC0, 0x4A, 0x7A),
+        rgb(0x2F, 0x6F, 0xC8),
+        rgb(0xA0, 0x5A, 0x2C),
+        rgb(0x5C, 0x7A, 0x1E),
+        rgb(0x8E, 0x3B, 0x3B),
+        rgb(0x4A, 0x55, 0x6A),
+    ],
     BAR_SLACK: rgb(0x2C, 0x9C, 0x8F),
     BAR_INACTIVE: rgb(0xE6, 0xE6, 0xE6),
     BAR_COMPLETE: rgb(0x92, 0xA8, 0xC6),
@@ -155,6 +172,7 @@ const fn dark_palette(
         TITLE_BAR: title,
         GOLD: rgb(0xF2, 0xB1, 0x1C),
         TEXT: rgb(0xEC, 0xEC, 0xEC),
+        TEXT_ON_ACCENT: rgb(0xFF, 0xFF, 0xFF),
         TEXT_WEAK: text_weak,
         BG: bg,
         PANEL_BG: panel,
@@ -178,6 +196,19 @@ const fn dark_palette(
         BAR_CRITICAL_EDGE: rgb(0xF0, 0x8A, 0x8A),
         BAR_SUMMARY: rgb(0xD8, 0xD8, 0xD8),
         BAR_MANUAL: rgb(0x6F, 0x92, 0xC8),
+        BASELINE_SERIES: [
+            rgb(0x9A, 0xA1, 0xAE),
+            rgb(0x4F, 0xC1, 0xC1),
+            rgb(0xE8, 0xB0, 0x40),
+            rgb(0xA9, 0x86, 0xE6),
+            rgb(0x72, 0xC2, 0x6E),
+            rgb(0xE8, 0x7D, 0xA8),
+            rgb(0x6E, 0xA4, 0xF0),
+            rgb(0xD0, 0x8C, 0x5C),
+            rgb(0xA8, 0xC8, 0x5A),
+            rgb(0xD8, 0x7A, 0x7A),
+            rgb(0xA8, 0xB2, 0xC6),
+        ],
         BAR_BASELINE: rgb(0x70, 0x70, 0x70),
         BAR_SLACK: rgb(0x3F, 0xB8, 0xA8),
         BAR_INACTIVE: line_strong,
@@ -471,7 +502,7 @@ mod tests {
     }
     /// Glyphs the bundled egui fonts cannot render (they show as empty boxes).
     /// Found by rendering a glyph sheet; extend when a new icon turns out to be missing.
-    const MISSING_GLYPHS: &str = "→↶↷⊘▤▸◆●⮜🗂🗒🤖ⓘ⊕⊖⇄✎⬚▦◯🗓✓✗✘⬤▢◈◇❖✜🧭🧮🗃🧑⏩▬";
+    const MISSING_GLYPHS: &str = "→↶↷⊘▤▸◆●⮜🗂🗒🤖ⓘ⊕⊖⇄✎⬚▦◯🗓✓✗✘⬤▢◈◇❖✜🧭🧮🗃🧑⏩▬↑↓⇥⇤⇹";
 
     fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for e in std::fs::read_dir(dir).unwrap().flatten() {

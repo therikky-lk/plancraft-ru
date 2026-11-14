@@ -36,6 +36,8 @@ pub struct EarnedValue {
     pub cv: f64,
     pub spi: f64,
     pub cpi: f64,
+    /// The baseline (0–10) the values are measured against.
+    pub baseline: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -156,20 +158,26 @@ pub fn earned_value(p: &Project, at: NaiveDateTime) -> Option<EarnedValue> {
     let leaves = p.tasks.iter().filter(|t| !t.sched.is_summary && t.active);
     let mut ev = EarnedValue::default();
     let mut any_baseline = false;
+    let slot = p.settings.earned_value_baseline;
     for t in leaves {
-        let Some(b) = t.baseline else { continue };
+        let Some(b) = t.baseline_in(slot) else { continue };
         any_baseline = true;
         ev.bcws += b.cost * planned_fraction(b.start, b.finish, at, p);
         ev.bcwp += b.cost * t.sched.percent_complete as f64 / 100.0;
-        // Actual cost: work-based actual cost proportionally to actual work, plus fixed cost when started.
-        let planned_work = t.sched.work.max(1) as f64;
-        let actual_ratio =
-            if t.sched.work > 0 { t.sched.actual_work as f64 / planned_work } else { t.sched.percent_complete as f64 / 100.0 };
+        // Actual cost (ACWP): the cost of the work done so far. Progress entered as actual work
+        // (tracked time) counts as that work; progress entered as % complete counts as that share
+        // of the work, as it does for tasks with no resources.
+        let actual_ratio = if t.sched.work > 0 && t.sched.actual_work > 0 {
+            t.sched.actual_work as f64 / t.sched.work as f64
+        } else {
+            t.sched.percent_complete as f64 / 100.0
+        };
         ev.acwp += t.sched.cost * actual_ratio;
     }
     if !any_baseline {
         return None;
     }
+    ev.baseline = slot;
     ev.sv = ev.bcwp - ev.bcws;
     ev.cv = ev.bcwp - ev.acwp;
     ev.spi = if ev.bcws > 0.0 { ev.bcwp / ev.bcws } else { 1.0 };
@@ -183,7 +191,7 @@ pub fn project_stats(p: &Project) -> ProjectStats {
     let wc = project_calendar(p);
     let leaves: Vec<&Task> = p.tasks.iter().filter(|t| !t.sched.is_summary).collect();
     let baseline_finish = p.tasks.iter().filter_map(|t| t.baseline.map(|b| b.finish)).max();
-    let baseline_cost = p.tasks.iter().filter(|t| !t.sched.is_summary).filter_map(|t| t.baseline.map(|b| b.cost)).sum();
+    let baseline_cost = crate::baseline::baseline_totals(p, 0).0;
     let over = crate::workload::overallocations(p).len();
     ProjectStats {
         name: p.name.clone(),

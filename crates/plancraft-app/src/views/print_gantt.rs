@@ -30,15 +30,31 @@ pub struct PrintSettings {
     pub resources: bool,
     pub page: usize,
     pub zoom: f32,
+    native_paper: Option<plancraft_core::print::Paper>,
     cache: Option<(String, TextureHandle)>,
 }
 impl Default for PrintSettings {
     fn default() -> Self {
-        Self { paper: Paper::A4, landscape: true, days: 28, current_scale: false, resources: false, page: 0, zoom: 0.9, cache: None }
+        Self {
+            paper: Paper::A4,
+            landscape: true,
+            days: 28,
+            current_scale: false,
+            resources: false,
+            page: 0,
+            zoom: 0.9,
+            native_paper: None,
+            cache: None,
+        }
     }
 }
 impl PrintSettings {
     fn mm(&self) -> (f32, f32) {
+        if let Some(paper) = self.native_paper {
+            let (w, h) = paper.size();
+            let (w, h) = (w * 25.4 / 72.0, h * 25.4 / 72.0);
+            return if self.landscape { (h, w) } else { (w, h) };
+        }
         let (w, h) = match self.paper {
             Paper::A4 => (210.0, 297.0),
             Paper::A3 => (297.0, 420.0),
@@ -47,9 +63,75 @@ impl PrintSettings {
     }
 }
 
+/// Rasterizes the shared PDF/preview page for the existing Windows printer boundary.
+#[cfg(any(windows, test))]
+fn render_document_page(parent: &egui::Context, page: &plancraft_core::print::Page) -> anyhow::Result<ColorImage> {
+    let size = vec2(page.width, page.height);
+    let ctx = egui::Context::default();
+    ctx.set_fonts(parent.fonts(|f| f.definitions().clone()));
+    ctx.set_pixels_per_point(300.0 / 72.0);
+    let mut textures = raster::Textures::default();
+    let mut image = None;
+    for pass in 0..2 {
+        let mut output =
+            ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() }, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    crate::dialogs::print::paint_page(ui.painter(), Rect::from_min_size(egui::Pos2::ZERO, size), page, 1.0);
+                });
+            });
+        let applied = textures.update(&output.textures_delta);
+        output.textures_delta.clear();
+        applied?;
+        if pass == 1 {
+            let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+            image = Some(raster::render(&primitives, &textures, size, output.pixels_per_point)?);
+        }
+    }
+    image.ok_or_else(|| anyhow::anyhow!("No print image"))
+}
+
+#[cfg(windows)]
+pub(crate) fn print_document(
+    ctx: &egui::Context,
+    document: &plancraft_core::print::Document,
+    setup: &plancraft_core::print::PageSetup,
+) -> anyhow::Result<bool> {
+    let settings = PrintSettings {
+        native_paper: Some(setup.paper),
+        landscape: setup.orientation == plancraft_core::print::Orientation::Landscape,
+        ..Default::default()
+    };
+    windows::print(&document.title, &settings, &|_| Ok(document.pages.len()), &|_, index| {
+        let page = document.pages.get(index).ok_or_else(|| anyhow::anyhow!("Invalid print page"))?;
+        render_document_page(ctx, page)
+    })
+}
+
+fn preview_image(image: ColorImage, max_side: usize) -> ColorImage {
+    let [w, h] = image.size;
+    let step = w.max(h).div_ceil(max_side.max(1)).max(1);
+    if step == 1 {
+        return image;
+    }
+    let size = [w.div_ceil(step), h.div_ceil(step)];
+    let pixels = (0..size[1])
+        .flat_map(|y| {
+            let image = &image;
+            (0..size[0]).map(move |x| {
+                image
+                    .pixels
+                    .get(y.saturating_mul(step).saturating_mul(w).saturating_add(x.saturating_mul(step)))
+                    .copied()
+                    .unwrap_or_default()
+            })
+        })
+        .collect();
+    ColorImage::new(size, pixels)
+}
+
 /// Immutable row/date pagination, shared by the preview and the printer.
 struct Layout {
-    rows: Vec<usize>,
+    rows: Vec<super::Row>,
     start: NaiveDateTime,
     days: usize,
     horizontal: usize,
@@ -71,7 +153,7 @@ impl Layout {
         let mut start = None;
         let mut finish = None;
         for idx in &rows {
-            if let Some(t) = p.tasks.get(*idx) {
+            if let Some(t) = idx.task().and_then(|i| p.tasks.get(i)) {
                 for d in
                     [t.sched.start, t.baseline.filter(|_| st.gantt.show_baseline || st.view == ViewKind::TrackingGantt).map(|b| b.start)]
                         .into_iter()
@@ -86,7 +168,7 @@ impl Layout {
                 {
                     finish = Some(finish.map_or(d, |old: NaiveDateTime| old.max(d)));
                 }
-            } else if let Some(group) = super::group_header(*idx) {
+            } else if let Some(group) = super::group_header(p, idx) {
                 if let Some(d) = group.start {
                     start = Some(start.map_or(d, |old| old.min(d)));
                 }
@@ -186,7 +268,7 @@ impl Layout {
                             spreadsheet: false,
                             row_label: Some(&|row| {
                                 rows.get(row)
-                                    .and_then(|idx| p.tasks.get(*idx))
+                                    .and_then(|idx| idx.task().and_then(|i| p.tasks.get(i)))
                                     .and_then(|t| p.row_number(t.id))
                                     .map(|n| n.to_string())
                                     .unwrap_or_default()
@@ -205,8 +287,8 @@ impl Layout {
                             &|_| false,
                             &mut |r, c| {
                                 let (Some(idx), Some(col)) = (rows.get(r), self.cols.get(c)) else { return grid::Cell::default() };
-                                if let Some(t) = p.tasks.get(*idx) {
-                                    let mut cell = columns::cell(*col, p, *idx, &cell_ctx);
+                                if let Some(t) = idx.task().and_then(|i| p.tasks.get(i)) {
+                                    let mut cell = idx.task().map(|i| columns::cell(*col, p, i, &cell_ctx)).unwrap_or_default();
                                     if *col == TaskCol::Start {
                                         cell.text = t.sched.start.map(|d| d.format("%Y/%m/%d").to_string()).unwrap_or_default();
                                     }
@@ -214,7 +296,7 @@ impl Layout {
                                         cell.text = t.sched.finish.map(|d| d.format("%Y/%m/%d").to_string()).unwrap_or_default();
                                     }
                                     cell
-                                } else if let Some(group) = super::group_header(*idx) {
+                                } else if let Some(group) = super::group_header(p, idx) {
                                     grid::Cell {
                                         text: if *col == TaskCol::Name { group.label } else { String::new() },
                                         bold: true,
@@ -238,7 +320,11 @@ impl Layout {
                             project: p,
                             rows,
                             selected: &|_| false,
-                            tracking: st.view == ViewKind::TrackingGantt,
+                            kind: match st.view {
+                                ViewKind::TrackingGantt => super::gantt_chart::ChartKind::Tracking,
+                                ViewKind::MultipleBaselines => super::gantt_chart::ChartKind::Baselines,
+                                _ => super::gantt_chart::ChartKind::Gantt,
+                            },
                             row_height: ROW,
                             header_height: HEADER,
                             blank_rows: 0,
@@ -353,7 +439,11 @@ pub fn show(ui: &mut egui::Ui, p: &Project, st: &UiState, s: &mut PrintSettings,
     );
     if s.cache.as_ref().is_none_or(|(old, _)| old != &key) {
         match layout.render(ui.ctx(), p, st, s.page) {
-            Ok(img) => s.cache = Some((key, ui.ctx().load_texture("gantt_print_page", img, egui::TextureOptions::LINEAR))),
+            Ok(img) => {
+                let max_side = ui.ctx().input(|i| i.max_texture_side);
+                let img = preview_image(img, max_side);
+                s.cache = Some((key, ui.ctx().load_texture("gantt_print_page", img, egui::TextureOptions::LINEAR)));
+            }
             Err(e) => {
                 s.cache = None;
                 ui.colored_label(theme::pal().ERROR, e.to_string());
@@ -387,6 +477,17 @@ pub fn show(ui: &mut egui::Ui, p: &Project, st: &UiState, s: &mut PrintSettings,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_respects_small_texture_limits_and_shared_pages_rasterize() {
+        let image = ColorImage::filled([3000, 2200], egui::Color32::WHITE);
+        let preview = preview_image(image, 1024);
+        assert!(preview.size.into_iter().all(|side| side <= 1024));
+        let page = plancraft_core::print::Page { width: 180.0, height: 120.0, items: Vec::new() };
+        let image = render_document_page(&context(), &page).unwrap();
+        assert_eq!(image.size, [750, 500]);
+        assert!(image.pixels.iter().all(|c| *c == egui::Color32::WHITE));
+    }
     fn project() -> Project {
         plancraft_core::sample::demo_project(chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap())
     }
@@ -413,7 +514,7 @@ mod tests {
             let mut seen = Vec::new();
             for page in (0..l.pages).step_by(l.horizontal) {
                 let from = page / l.horizontal * l.per_page;
-                seen.extend(l.rows.get(from..(from + l.per_page).min(l.rows.len())).unwrap().iter().copied());
+                seen.extend(l.rows.get(from..(from + l.per_page).min(l.rows.len())).unwrap().iter().cloned());
             }
             assert_eq!(seen, l.rows);
             assert!(l.days * l.horizontal >= (p.sched.finish.unwrap() - l.start).num_days() as usize);

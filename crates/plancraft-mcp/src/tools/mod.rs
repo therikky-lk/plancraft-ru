@@ -10,14 +10,19 @@ use crate::server::Ctx;
 
 pub mod analysis;
 pub mod assignments;
+pub mod board;
 pub mod calendars;
+pub mod custom_fields;
 pub mod dependencies;
 pub mod documents;
 pub mod history;
 pub mod milestones;
+pub mod print;
+pub mod recurring;
 pub mod resources;
 pub mod tasks;
 pub mod time;
+pub mod tracking;
 
 /// A tool handler.
 pub type Handler = fn(&Ctx, &Args) -> ToolResult;
@@ -112,9 +117,14 @@ pub fn all_tools() -> Vec<Tool> {
     v.extend(resources::tools());
     v.extend(assignments::tools());
     v.extend(calendars::tools());
+    v.extend(custom_fields::tools());
     v.extend(time::tools());
     v.extend(analysis::tools());
     v.extend(history::tools());
+    v.extend(print::tools());
+    v.extend(tracking::tools());
+    v.extend(recurring::tools());
+    v.extend(board::tools());
     v
 }
 
@@ -263,6 +273,9 @@ pub fn task_field_props() -> Map<String, Value> {
         "percent_complete": number("Progress 0-100. Sets actual start/finish automatically."),
         "actual_start": date_or_null("Actual start date."),
         "actual_finish": date_or_null("Actual finish date."),
+        "actual_duration": duration("Progress as working time done so far; sets % complete. Past the planned duration, it stretches the duration and completes the task."),
+        "remaining_duration": duration("Progress as working time still needed; the duration becomes time done + this, and % complete follows."),
+        "resume": date_or_null("For a task in progress (1-99%): when its remaining work restarts. A date later than its stop pauses the task there until then (a split); a date before the stop is refused; null removes a pause still ahead."),
         "manual_start": date_or_null("Manually entered start (used by manual tasks)."),
         "manual_finish": date_or_null("Manually entered finish (used by manual tasks)."),
         "calendar": { "type": ["integer", "string", "null"], "description": "Task calendar id or name; null uses the project/resource calendars." },
@@ -272,10 +285,13 @@ pub fn task_field_props() -> Map<String, Value> {
         "estimate": estimate(),
         "deliverable": string("For milestones: the output achieved at this milestone."),
         "show_on_timeline": boolean("Show this task on the timeline view."),
+        "board_status": { "type": ["string", "integer", "null"], "description": "Task Board column (Board Status) by name or id; a column with a Set % Complete value also sets % complete. null puts the card back in the first column." },
+        "show_on_board": boolean("Show this task as a card on the Task Board (default true)."),
         "is_milestone": boolean("Convert to a milestone (true) or a normal task (false)."),
         "predecessors": predecessors("Predecessor links."),
         "resources": string("Resource assignments in 'Resource Names' syntax, e.g. \"Ana[50%], Bob\". Unknown names create new work resources. Replaces existing assignments; \"\" removes all."),
-        "bar_color": { "type": ["string", "null"], "description": "Gantt bar color as \"#RRGGBB\"; null resets." }
+        "bar_color": { "type": ["string", "null"], "description": "Gantt bar color as \"#RRGGBB\"; null resets." },
+        "custom": custom_fields::custom_values_prop()
     });
     match v {
         Value::Object(m) => m,

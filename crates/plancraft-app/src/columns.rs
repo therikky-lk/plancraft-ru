@@ -26,16 +26,20 @@ pub enum TaskCol {
     RemainingWork,
     Cost,
     FixedCost,
-    BaselineStart,
-    BaselineFinish,
-    BaselineWork,
-    BaselineCost,
+    /// A value of Baseline (0) or Baseline1–10.
+    Baseline(u8, BlField),
+    /// Interim plan 1–10: its start (`false`) or finish (`true`), the Start*n* and Finish*n* fields.
+    Interim(u8, bool),
     StartVariance,
     FinishVariance,
     WorkVariance,
     CostVariance,
     ActualStart,
     ActualFinish,
+    ActualDuration,
+    RemainingDuration,
+    Stop,
+    Resume,
     EarlyStart,
     EarlyFinish,
     LateStart,
@@ -69,9 +73,50 @@ pub enum TaskCol {
     Bac,
     Vac,
     OutlineNumber,
+    /// Yes for a recurring task and its occurrences.
+    Recurring,
+    /// The Task Board column a task's card is in.
+    BoardStatus,
+    /// Whether the task has a card on the Task Board.
+    ShowOnBoard,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The values a baseline holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlField {
+    Start,
+    Finish,
+    Duration,
+    Work,
+    Cost,
+}
+
+impl BlField {
+    pub const ALL: [BlField; 5] = [BlField::Start, BlField::Finish, BlField::Duration, BlField::Work, BlField::Cost];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BlField::Start => "Start",
+            BlField::Finish => "Finish",
+            BlField::Duration => "Duration",
+            BlField::Work => "Work",
+            BlField::Cost => "Cost",
+        }
+    }
+
+    /// The key suffix in table layouts ("start", "finish", ...).
+    pub fn key(self) -> &'static str {
+        match self {
+            BlField::Start => "start",
+            BlField::Finish => "finish",
+            BlField::Duration => "duration",
+            BlField::Work => "work",
+            BlField::Cost => "cost",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TaskTable {
     Entry,
     Schedule,
@@ -86,6 +131,21 @@ pub enum TaskTable {
 }
 
 impl TaskTable {
+    /// Stable storage key; table layouts must survive switching the UI language.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Entry => "Entry",
+            Self::Schedule => "Schedule",
+            Self::Tracking => "Tracking",
+            Self::Work => "Work",
+            Self::Cost => "Cost",
+            Self::Estimates => "Estimates",
+            Self::Variance => "Variance",
+            Self::Summary => "Summary",
+            Self::Details => "Details",
+            Self::EarnedValue => "Earned Value",
+        }
+    }
     pub const ALL: [TaskTable; 10] = [
         TaskTable::Entry,
         TaskTable::Schedule,
@@ -132,17 +192,49 @@ impl TaskTable {
                 Deadline,
             ],
             TaskTable::Tracking => {
-                vec![Indicators, Name, ActualStart, ActualFinish, PercentComplete, Duration, ActualWork, RemainingWork, Cost]
+                vec![
+                    Indicators,
+                    Name,
+                    ActualStart,
+                    ActualFinish,
+                    PercentComplete,
+                    ActualDuration,
+                    RemainingDuration,
+                    ActualWork,
+                    RemainingWork,
+                    Cost,
+                ]
             }
-            TaskTable::Work => vec![Indicators, Name, Work, BaselineWork, WorkVariance, ActualWork, RemainingWork, PercentComplete],
+            TaskTable::Work => {
+                vec![Indicators, Name, Work, Baseline(0, BlField::Work), WorkVariance, ActualWork, RemainingWork, PercentComplete]
+            }
             TaskTable::Cost => {
-                vec![Indicators, Name, FixedCost, FixedCostAccrual, Cost, BaselineCost, CostVariance, ActualCost, RemainingCost]
+                vec![
+                    Indicators,
+                    Name,
+                    FixedCost,
+                    FixedCostAccrual,
+                    Cost,
+                    Baseline(0, BlField::Cost),
+                    CostVariance,
+                    ActualCost,
+                    RemainingCost,
+                ]
             }
             TaskTable::EarnedValue => vec![Indicators, Name, Bcws, Bcwp, Acwp, Sv, Cv, Eac, Bac, Vac],
             TaskTable::Estimates => {
                 vec![Indicators, Name, EstimateMethod, Points, Optimistic, MostLikely, Pessimistic, ExpectedWork, Work, Duration, Resources]
             }
-            TaskTable::Variance => vec![Indicators, Name, Start, Finish, BaselineStart, BaselineFinish, StartVariance, FinishVariance],
+            TaskTable::Variance => vec![
+                Indicators,
+                Name,
+                Start,
+                Finish,
+                Baseline(0, BlField::Start),
+                Baseline(0, BlField::Finish),
+                StartVariance,
+                FinishVariance,
+            ],
             TaskTable::Summary => {
                 vec![Indicators, OutlineNumber, Wbs, Name, Duration, Start, Finish, PercentComplete, Cost, Work, Milestones]
             }
@@ -158,7 +250,7 @@ impl TaskCol {
         use TaskCol::*;
         let _ = p;
         match self {
-            Indicators => ColumnDef::new("ℹ", 34.0).read_only().center(),
+            Indicators => ColumnDef::new(crate::tr("ℹ"), 34.0).read_only().center(),
             Mode => {
                 ColumnDef::new(crate::tr("Mode"), 46.0).center().choice(&[crate::tr("Auto Scheduled"), crate::tr("Manually Scheduled")])
             }
@@ -176,10 +268,10 @@ impl TaskCol {
             RemainingWork => ColumnDef::new(crate::tr("Rem. Work"), 72.0).right().read_only(),
             Cost => ColumnDef::new(crate::tr("Total Cost"), 90.0).right().read_only(),
             FixedCost => ColumnDef::new(crate::tr("Fixed Cost"), 86.0).right(),
-            BaselineStart => ColumnDef::new(crate::tr("Baseline Start"), 100.0).read_only(),
-            BaselineFinish => ColumnDef::new(crate::tr("Baseline Finish"), 100.0).read_only(),
-            BaselineWork => ColumnDef::new(crate::tr("Baseline Work"), 86.0).right().read_only(),
-            BaselineCost => ColumnDef::new(crate::tr("Baseline Cost"), 90.0).right().read_only(),
+            Baseline(0, BlField::Start) => ColumnDef::new(crate::tr("Baseline Start"), 100.0).read_only(),
+            Baseline(0, BlField::Finish) => ColumnDef::new(crate::tr("Baseline Finish"), 100.0).read_only(),
+            Baseline(0, BlField::Work) => ColumnDef::new(crate::tr("Baseline Work"), 86.0).right().read_only(),
+            Baseline(0, BlField::Cost) => ColumnDef::new(crate::tr("Baseline Cost"), 90.0).right().read_only(),
             StartVariance => ColumnDef::new(crate::tr("Start Var."), 76.0).right().read_only(),
             FinishVariance => ColumnDef::new(crate::tr("Finish Var."), 76.0).right().read_only(),
             WorkVariance => ColumnDef::new(crate::tr("Work Var."), 72.0).right().read_only(),
@@ -228,6 +320,24 @@ impl TaskCol {
             Bac => ColumnDef::new(crate::tr("BAC"), 96.0).right().read_only(),
             Vac => ColumnDef::new(crate::tr("VAC"), 96.0).right().read_only(),
             OutlineNumber => ColumnDef::new(crate::tr("Outline Number"), 60.0).read_only(),
+            Baseline(n, f) => {
+                let title = format!("{} {}", PlanSlot::Baseline(n).name(), f.label());
+                match f {
+                    BlField::Start | BlField::Finish => ColumnDef::new(title, 106.0).read_only(),
+                    _ => ColumnDef::new(title, 96.0).right().read_only(),
+                }
+            }
+            Interim(n, finish) => ColumnDef::new(format!("{}{n}", if finish { "Finish" } else { "Start" }), 96.0).read_only(),
+            ActualDuration => ColumnDef::new(crate::tr("Act. Dur."), 76.0).right(),
+            RemainingDuration => ColumnDef::new(crate::tr("Rem. Dur."), 76.0).right(),
+            Stop => ColumnDef::new(crate::tr("Stop"), 100.0).read_only(),
+            Resume => ColumnDef::new(crate::tr("Resume"), 100.0),
+            Recurring => ColumnDef::new(crate::tr("Recurring"), 70.0).center().read_only(),
+            BoardStatus => {
+                let names: Vec<&str> = p.board_columns.iter().map(|c| c.name.as_str()).collect();
+                ColumnDef::new(crate::tr("Board Status"), 110.0).choice(&names)
+            }
+            ShowOnBoard => ColumnDef::new(crate::tr("Show on Board"), 92.0).center().choice(&["Yes", "No"]),
         }
     }
 }
@@ -281,6 +391,10 @@ pub fn indicators(p: &Project, t: &Task, overallocated: &dyn Fn(TaskId) -> bool)
             ),
         );
     }
+    if t.recurrence_pattern.is_some() {
+        let n = p.task_index(t.id).map_or(0, |i| p.descendants_range(i).len());
+        v.insert(0, ("🔁".into(), theme::pal().ACCENT_MID, format!("Recurring task with {n} occurrences")));
+    }
     let _ = p;
     v.truncate(2);
     v
@@ -330,10 +444,18 @@ pub fn cell(col: TaskCol, p: &Project, idx: usize, ctx: &CellCtx) -> Cell {
         RemainingWork => Cell::text(format_work((s.work - s.actual_work).max(0))),
         Cost => Cell::text(format::money(p, s.cost)),
         FixedCost => Cell::text(format::money(p, t.fixed_cost)),
-        BaselineStart => Cell::text(t.baseline.map(|b| format::date(Some(b.start))).unwrap_or_else(crate::format::na)),
-        BaselineFinish => Cell::text(t.baseline.map(|b| format::date(Some(b.finish))).unwrap_or_else(crate::format::na)),
-        BaselineWork => Cell::text(t.baseline.map(|b| format_work(b.work)).unwrap_or_default()),
-        BaselineCost => Cell::text(t.baseline.map(|b| format::money(p, b.cost)).unwrap_or_default()),
+        Baseline(n, f) => Cell::text(match (t.baseline_in(n), f) {
+            (Some(b), BlField::Start) => format::date(Some(b.start)),
+            (Some(b), BlField::Finish) => format::date(Some(b.finish)),
+            (Some(b), BlField::Duration) => p.format_duration(b.duration, false),
+            (Some(b), BlField::Work) => format_work(b.work),
+            (Some(b), BlField::Cost) => format::money(p, b.cost),
+            (None, BlField::Start | BlField::Finish) => "NA".into(),
+            (None, _) => String::new(),
+        }),
+        Interim(n, finish) => {
+            Cell::text(t.interim_in(n).map_or_else(|| "NA".into(), |i| format::date(Some(if finish { i.finish } else { i.start }))))
+        }
         StartVariance | FinishVariance => {
             let wc = plancraft_core::schedule::project_calendar(p);
             let v = match (t.baseline, s.start, s.finish) {
@@ -357,6 +479,12 @@ pub fn cell(col: TaskCol, p: &Project, idx: usize, ctx: &CellCtx) -> Cell {
         ActualFinish => {
             Cell { text: format::date(t.actual_finish), edit_text: Some(format::iso_date(t.actual_finish)), ..Default::default() }
         }
+        ActualDuration | RemainingDuration => {
+            let (done, left) = t.duration_progress();
+            Cell::text(p.format_duration(if col == ActualDuration { done } else { left }, false))
+        }
+        Stop => Cell::text(format::date(s.stop)),
+        Resume => Cell { text: format::date(s.resume), edit_text: Some(format::iso_date(s.resume)), ..Default::default() },
         EarlyStart => Cell::text(format::date(s.early_start)),
         EarlyFinish => Cell::text(format::date(s.early_finish)),
         LateStart => Cell::text(format::date(s.late_start)),
@@ -432,6 +560,11 @@ pub fn cell(col: TaskCol, p: &Project, idx: usize, ctx: &CellCtx) -> Cell {
             None => Cell::default(),
         },
         OutlineNumber => Cell::weak(outline_number(p, idx)),
+        Recurring => Cell::text(if p.is_recurring(idx) { "Yes" } else { "No" }),
+        // Summary tasks have no card; their subtasks do.
+        BoardStatus if summary => Cell::default(),
+        BoardStatus => Cell::text(p.board_column_of(idx).and_then(|c| p.board_column(c)).map(|c| c.name.clone()).unwrap_or_default()),
+        ShowOnBoard => Cell::text(if t.show_on_board { "Yes" } else { "No" }),
     };
     if summary && col != Name && col != Indicators {
         c.bold = true;
@@ -526,6 +659,27 @@ pub fn commit(col: TaskCol, p: &mut Project, id: TaskId, text: &str) -> Result<(
             let deps = p.parse_predecessors(text).map_err(err)?;
             p.set_predecessors(id, deps).map_err(err)?;
         }
+        BoardStatus => {
+            if summary {
+                return Err("summary tasks have no card on the board; their subtasks do".into());
+            }
+            if text.trim().is_empty() {
+                // Cleared: the card goes back to the first column.
+                task_mut(p, id)?.board_status = None;
+                return Ok(());
+            }
+            let col = p.find_board_column(text).ok_or_else(|| format!("there is no board column named '{}'", text.trim()))?;
+            p.set_board_status(&[id], col).map_err(err)?;
+        }
+        ShowOnBoard => {
+            let yes = text.trim().to_lowercase();
+            let show = match yes.as_str() {
+                "yes" | "y" | "true" => true,
+                "no" | "n" | "false" => false,
+                _ => return Err("Show on Board is Yes or No".into()),
+            };
+            p.set_show_on_board(&[id], show).map_err(err)?;
+        }
         Resources => p.apply_resource_names(id, text).map_err(err)?,
         PercentComplete => {
             let v: f64 =
@@ -554,6 +708,14 @@ pub fn commit(col: TaskCol, p: &mut Project, id: TaskId, text: &str) -> Result<(
         }
         FixedCost => task_mut(p, id)?.fixed_cost = format::parse_money(text).ok_or(crate::tr("invalid amount"))?,
         ActualStart => task_mut(p, id)?.actual_start = parse_date(p, text, false)?,
+        ActualDuration | RemainingDuration => {
+            let (m, _) = p.parse_duration(text).ok_or_else(|| format!("'{text}' is not a valid duration"))?;
+            if col == ActualDuration { p.set_actual_duration(id, m) } else { p.set_remaining_duration(id, m) }.map_err(err)?;
+        }
+        Resume => {
+            let d = parse_date(p, text, false)?;
+            p.set_resume(id, d).map_err(err)?;
+        }
         ActualFinish => {
             let d = parse_date(p, text, true)?;
             let t = task_mut(p, id)?;
@@ -628,15 +790,27 @@ pub fn commit(col: TaskCol, p: &mut Project, id: TaskId, text: &str) -> Result<(
             t.estimate = Some(Estimate::ThreePoint { optimistic: o, most_likely: m, pessimistic: pe });
         }
         Deliverable => task_mut(p, id)?.deliverable = text.to_string(),
-        Notes => task_mut(p, id)?.notes = text.to_string(),
         FixedCostAccrual => {
             task_mut(p, id)?.fixed_cost_accrual = match text {
                 "Start of task" => Accrual::Start,
                 "End of task" => Accrual::End,
                 _ => Accrual::Prorated,
-            }
+            };
         }
-        _ => return Err(crate::tr("this field is calculated and cannot be edited").into()),
+        Notes => {
+            // The cell shows and edits only the first line; keep the rest of a longer note.
+            let t = task_mut(p, id)?;
+            t.notes = if text.contains('\n') || text == t.notes {
+                text.to_string()
+            } else {
+                match t.notes.split_once('\n') {
+                    Some((_, rest)) if text.is_empty() => rest.to_string(),
+                    Some((_, rest)) => format!("{text}\n{rest}"),
+                    None => text.to_string(),
+                }
+            };
+        }
+        _ => return Err("this field is calculated and cannot be edited".into()),
     }
     Ok(())
 }
@@ -668,4 +842,26 @@ pub fn note_tooltip(notes: &str, files: &[plancraft_core::attach::Attachment]) -
         s += &format!("📄 {}", a.name);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    /// Regression: the Notes cell shows only the first line, and committing it used to replace
+    /// the whole note with that line.
+    #[test]
+    fn editing_the_notes_cell_keeps_the_other_lines() {
+        let mut p = Project::new("Notes", NaiveDate::from_ymd_opt(2026, 10, 19).unwrap());
+        let id = p.add_task("Task", None);
+        p.task_mut(id).unwrap().notes = "first\nsecond\nthird".into();
+        commit(TaskCol::Notes, &mut p, id, "changed").unwrap();
+        assert_eq!(p.task(id).unwrap().notes, "changed\nsecond\nthird");
+        commit(TaskCol::Notes, &mut p, id, "").unwrap();
+        assert_eq!(p.task(id).unwrap().notes, "second\nthird");
+        p.task_mut(id).unwrap().notes = "one line".into();
+        commit(TaskCol::Notes, &mut p, id, "replaced").unwrap();
+        assert_eq!(p.task(id).unwrap().notes, "replaced");
+    }
 }

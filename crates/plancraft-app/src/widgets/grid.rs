@@ -24,6 +24,8 @@ pub struct ColumnDef {
     pub width: f32,
     pub align: Align,
     pub editor: Editor,
+    /// The view is sorted by this column: `Some(descending)` draws an arrow in the header.
+    pub sort: Option<bool>,
 }
 
 impl ColumnDef {
@@ -31,7 +33,11 @@ impl ColumnDef {
         let title = title.into();
         // Translated headers are often longer; keep the whole title visible (≈7 px per character).
         let width = if plancraft_core::i18n::is_ru() { width.max(title.chars().count() as f32 * 7.4 + 14.0) } else { width };
-        Self { title, width, align: Align::Min, editor: Editor::Text }
+        Self { title, width, align: Align::Min, editor: Editor::Text, sort: None }
+    }
+    pub fn sorted(mut self, descending: Option<bool>) -> Self {
+        self.sort = descending;
+        self
     }
     pub fn right(mut self) -> Self {
         self.align = Align::Max;
@@ -89,7 +95,18 @@ pub struct Edit {
     pub row: usize,
     pub col: usize,
     pub text: String,
+    /// The value the editor opened with. Finishing with the text unchanged commits nothing, so
+    /// clicking through a cell never rewrites it (a display-rounded value or a date without its
+    /// time would otherwise change the data).
+    original: Option<String>,
     started: bool,
+}
+
+impl Edit {
+    /// Whether finishing this edit should report a commit.
+    fn changed(&self) -> bool {
+        self.original.as_deref().is_none_or(|o| o.trim() != self.text.trim())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -154,7 +171,7 @@ impl GridState {
 
     pub fn begin_edit(&mut self, row: usize, col: usize, text: String) {
         self.select_cell(row, col, false);
-        self.editing = Some(Edit { row, col, text, started: false });
+        self.editing = Some(Edit { row, col, original: Some(text.clone()), text, started: false });
     }
 }
 
@@ -198,6 +215,15 @@ pub enum GridEvent {
     ClickEmpty {
         row: usize,
     },
+    /// Click on a column header.
+    HeaderClick {
+        col: usize,
+    },
+    /// Right-click on a column header.
+    HeaderMenu {
+        col: usize,
+        pos: Pos2,
+    },
 }
 
 pub struct GridConfig<'a> {
@@ -221,7 +247,7 @@ pub struct GridOutput {
     pub body_response: egui::Response,
 }
 
-const ROW_NUM_W: f32 = 34.0;
+pub const ROW_NUM_W: f32 = 34.0;
 const HSCROLL_H: f32 = 12.0;
 const VSCROLL_W: f32 = 12.0;
 
@@ -332,7 +358,29 @@ pub fn show(
             Align::Min => Align2::LEFT_CENTER,
         };
         let hp = hdr_painter.with_clip_rect(r.shrink2(vec2(2.0, 0.0)).intersect(header));
+        let text_pos = if def.sort.is_some() && def.align == Align::Max { text_pos - vec2(12.0, 0.0) } else { text_pos };
         hp.text(text_pos, anchor, &def.title, font.clone(), theme::pal().TEXT);
+        if let Some(desc) = def.sort {
+            // A small triangle (drawn, not a glyph): up for ascending, down for descending.
+            let c = pos2(r.right() - 9.0, r.center().y);
+            let pts = if desc {
+                vec![c + vec2(-4.0, -2.5), c + vec2(4.0, -2.5), c + vec2(0.0, 3.0)]
+            } else {
+                vec![c + vec2(-4.0, 2.5), c + vec2(4.0, 2.5), c + vec2(0.0, -3.0)]
+            };
+            hp.add(egui::Shape::convex_polygon(pts, theme::pal().ACCENT_MID, Stroke::NONE));
+        }
+        // Click to sort, right-click for the column menu (the resize handle below wins at the edge).
+        let visible = r.intersect(Rect::from_min_max(pos2(header.left() + rn_w, header.top()), header.max));
+        if visible.width() > 4.0 {
+            let hr = ui.interact(visible, cfg.id.with(("header", c)), Sense::click());
+            if hr.clicked() {
+                events.push(GridEvent::HeaderClick { col: c });
+            }
+            if hr.secondary_clicked() {
+                events.push(GridEvent::HeaderMenu { col: c, pos: hr.interact_pointer_pos().unwrap_or(r.left_bottom()) });
+            }
+        }
         // Resize handle.
         let handle = Rect::from_center_size(pos2(r.right(), header.center().y), vec2(6.0, header.height()));
         if handle.left() > header.left() + rn_w && handle.right() < header.right() + 3.0 {
@@ -422,7 +470,8 @@ pub fn show(
             }
             if !content.text.is_empty() {
                 let color = content.color.unwrap_or(theme::pal().TEXT);
-                let galley = cp.layout_no_wrap(content.text.clone(), cell_font.clone(), color);
+                // Right-to-left text (Hebrew, Arabic) shows in display order.
+                let galley = cp.layout_no_wrap(plancraft_core::bidi::display(&content.text).into_owned(), cell_font.clone(), color);
                 let gx = match def.align {
                     Align::Max => r.right() - 5.0 - galley.size().x,
                     Align::Center => r.center().x - galley.size().x / 2.0,
@@ -741,7 +790,7 @@ pub fn show(
     if let Some((commit, mv)) = finished
         && let Some(e) = state.editing.take()
     {
-        if commit {
+        if commit && e.changed() {
             events.push(GridEvent::Commit { row: e.row, col: e.col, text: e.text.trim().to_string() });
         }
         if let Some((dr, dc)) = mv {
@@ -828,6 +877,9 @@ pub fn show(
             if let Some(t) = typed.filter(|t| !t.trim().is_empty()) {
                 if matches!(def.editor, Editor::Text | Editor::Date) {
                     state.begin_edit(r, c, t);
+                    if let Some(e) = state.editing.as_mut() {
+                        e.original = None;
+                    }
                     if let Some(e) = state.editing.as_mut() {
                         // Place cursor at end of the typed text.
                         let id = cfg.id.with(("edit", r, c));

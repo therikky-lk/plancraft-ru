@@ -64,9 +64,16 @@ pub(super) fn print(
             if !ptr.is_null() {
                 (*ptr).dmFields |= DM_ORIENTATION | DM_PAPERSIZE;
                 (*ptr).Anonymous1.Anonymous1.dmOrientation = if s.landscape { DMORIENT_LANDSCAPE as i16 } else { DMORIENT_PORTRAIT as i16 };
-                (*ptr).Anonymous1.Anonymous1.dmPaperSize = match s.paper {
-                    super::Paper::A4 => DMPAPER_A4 as i16,
-                    super::Paper::A3 => DMPAPER_A3 as i16,
+                (*ptr).Anonymous1.Anonymous1.dmPaperSize = match s.native_paper {
+                    Some(plancraft_core::print::Paper::Letter) => DMPAPER_LETTER as i16,
+                    Some(plancraft_core::print::Paper::Legal) => DMPAPER_LEGAL as i16,
+                    Some(plancraft_core::print::Paper::Tabloid) => DMPAPER_TABLOID as i16,
+                    Some(plancraft_core::print::Paper::A3) => DMPAPER_A3 as i16,
+                    Some(plancraft_core::print::Paper::A4) => DMPAPER_A4 as i16,
+                    None => match s.paper {
+                        super::Paper::A4 => DMPAPER_A4 as i16,
+                        super::Paper::A3 => DMPAPER_A3 as i16,
+                    },
                 };
                 GlobalUnlock(printer.dialog.hDevMode);
             }

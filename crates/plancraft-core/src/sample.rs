@@ -3,6 +3,7 @@
 use chrono::NaiveDate;
 
 use crate::calendar::CalendarException;
+use crate::custom::{CustomFieldKind, CustomValue};
 use crate::duration::Lag;
 use crate::ids::TaskId;
 use crate::model::*;
@@ -172,6 +173,25 @@ fn build(start: NaiveDate) -> PlanResult<Project> {
         let _ = p.log_time(scope, ana, s + chrono::Duration::days(i), 8 * 60, "Scoping workshop");
     }
     p.set_percent_complete(research, 40)?;
+
+    // Custom fields: a status pick-list and a risk rating.
+    let choices = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let status = p.add_custom_field("Status", CustomFieldKind::Text, &choices(&["To do", "In progress", "Blocked", "Done"]))?;
+    let risk = p.add_custom_field("Risk", CustomFieldKind::Text, &choices(&["Low", "Medium", "High"]))?;
+    let text = |s: &str| Some(CustomValue::Text(s.into()));
+    for (task, value) in [(scope, "Done"), (research, "In progress"), (backend, "To do"), (frontend, "To do"), (marketing, "To do")] {
+        p.set_custom_value(task, status, text(value))?;
+    }
+    for (task, value) in [(backend, "High"), (infra, "Medium"), (testing, "Medium"), (marketing, "Low")] {
+        p.set_custom_value(task, risk, text(value))?;
+    }
+    // The Task Board: work done, under way and up next.
+    let col = |p: &Project, k: usize| p.board_columns.get(k).map(|c| c.id);
+    if let (Some(next), Some(doing), Some(done)) = (col(&p, 1), col(&p, 2), col(&p, 3)) {
+        p.set_board_status(&[scope], done)?;
+        p.set_board_status(&[research], doing)?;
+        p.set_board_status(&[backend, frontend], next)?;
+    }
     let _ = planning;
     let _ = design;
     let _ = build;

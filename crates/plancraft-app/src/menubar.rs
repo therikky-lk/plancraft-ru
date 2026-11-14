@@ -35,6 +35,8 @@ pub struct MenuInfo {
     pub resource_selected: bool,
     pub mcp_running: bool,
     pub mcp_url: Option<String>,
+    /// Fields offered for sorting and grouping: (key, title), the table's columns first.
+    pub fields: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +621,10 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
                 });
             });
             group(ui, crate::tr("Editing"), |ui| {
+                stack(ui, |ui| {
+                    sm(ui, "÷", crate::tr("Split Task"), crate::tr("Click a Gantt bar to split it"), sel, Command::SplitTask);
+                    sm(ui, "↻", crate::tr("Rejoin Split Task"), "", sel, Command::RejoinTasks);
+                });
                 bg(ui, "🎯", crate::tr("Scroll to Task"), crate::tr("Scroll the chart to the task"), sel, Command::ScrollToTask);
             });
         }
@@ -712,9 +718,13 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
                 });
             });
             group(ui, crate::tr("Export"), |ui| {
+                stack(ui, |ui| {
+                    sm(ui, "printer", crate::tr("Print / PDF…"), crate::tr("Print preview and page setup"), doc, Command::Print);
+                    sm(ui, "PDF", crate::tr("Export PDF…"), "", doc, Command::ExportPdf);
+                });
                 bg(ui, "printer", crate::tr("Print Gantt…"), crate::tr("Preview and print the Gantt chart"), doc, Command::PrintGantt);
                 bg(ui, "🗐", crate::tr("Export CSV"), crate::tr("Export the task list as CSV"), doc, Command::ExportCsv);
-                bg(ui, "📤", crate::tr("Export to MS Project XML…"), "", doc, Command::ExportXml);
+                bg(ui, "📤", crate::tr("Export to MS Project XML…"), "", doc, Command::ExportMspdi);
             });
         }
         MenuTab::Project => {
@@ -749,16 +759,9 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
                 });
             });
             group(ui, crate::tr("Project Schedule"), |ui| {
-                bg(
-                    ui,
-                    "📏",
-                    crate::tr("Set Baseline"),
-                    crate::tr("Save the current schedule as the baseline"),
-                    doc,
-                    Command::BaselineDialog(false),
-                );
+                bg(ui, "📏", crate::tr("Set Baseline"), crate::tr("Save the current schedule as the baseline"), doc, Command::SetBaseline);
                 stack(ui, |ui| {
-                    sm(ui, "✖", crate::tr("Clear Baseline"), crate::tr("Clear the baseline"), doc, Command::BaselineDialog(true));
+                    sm(ui, "✖", crate::tr("Clear Baseline"), crate::tr("Clear the baseline"), doc, Command::ClearBaseline);
                 });
             });
             group(ui, crate::tr("Status"), |ui| {
@@ -827,6 +830,9 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
                     vb(ui, ViewKind::Timesheet, false);
                 });
             });
+            group(ui, crate::tr("Fields"), |ui| {
+                bg(ui, "#", crate::tr("Custom Fields…"), "", doc, Command::CustomFields);
+            });
             group(ui, crate::tr("Data"), |ui| {
                 stack(ui, |ui| {
                     labeled_combo(ui, "", crate::tr("Sort"), |ui| {
@@ -842,9 +848,10 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
                                 },
                             );
                         } else {
-                            egui::ComboBox::from_id_salt("tb_sort").width(130.0).selected_text(st.sort.label()).show_ui(ui, |ui| {
-                                for k in plancraft_core::extras::SortKey::TASKS {
-                                    ui.selectable_value(&mut st.sort, k, k.label());
+                            egui::ComboBox::from_id_salt("tb_sort").width(130.0).selected_text(crate::tr("Sort by")).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut st.sort, None, crate::tr("ID"));
+                                for (key, title) in &info.fields {
+                                    ui.selectable_value(&mut st.sort, Some((key.clone(), false)), title);
                                 }
                             });
                         }
@@ -905,9 +912,13 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
                                 },
                             );
                         } else {
-                            egui::ComboBox::from_id_salt("tb_group").width(130.0).selected_text(st.group.label()).show_ui(ui, |ui| {
+                            egui::ComboBox::from_id_salt("tb_group").width(130.0).selected_text(crate::tr("Group by")).show_ui(ui, |ui| {
                                 for g in crate::state::TaskGroup::ALL {
-                                    ui.selectable_value(&mut st.group, g, g.label());
+                                    ui.selectable_value(&mut st.group, g.key().map(str::to_string), g.label());
+                                }
+                                ui.separator();
+                                for (key, title) in &info.fields {
+                                    ui.selectable_value(&mut st.group, Some(key.clone()), title);
                                 }
                             });
                         }
@@ -940,7 +951,49 @@ fn ribbon(ui: &mut Ui, st: &mut UiState, info: &MenuInfo, push: &dyn Fn(Command)
             });
         }
         MenuTab::Format => {
+            if st.view == ViewKind::NetworkDiagram {
+                group(ui, crate::tr("Network Diagram"), |ui| {
+                    stack(ui, |ui| {
+                        ui.checkbox(&mut st.network.opts.critical_first, crate::tr("Critical First"));
+                        ui.checkbox(&mut st.network.show_summaries, crate::tr("Summary Tasks"));
+                        ui.checkbox(&mut st.network.link_labels, crate::tr("Link Labels"));
+                    });
+                    stack(ui, |ui| {
+                        ui.checkbox(&mut st.network.progress_marks, crate::tr("Progress Marks"));
+                        ui.checkbox(&mut st.network.opts.ids_only, crate::tr("IDs Only"));
+                    });
+                });
+                return;
+            }
+            if st.view == ViewKind::MultipleBaselines {
+                group(ui, crate::tr("Baselines"), |ui| {
+                    egui::ComboBox::from_id_salt("multiple_baselines_picker").selected_text(crate::tr("Baselines to display")).show_ui(
+                        ui,
+                        |ui| {
+                            for n in 0..=plancraft_core::baseline::MAX_BASELINE {
+                                let mut shown = st.gantt.multi_baselines & (1u16 << n) != 0;
+                                if ui.checkbox(&mut shown, plancraft_core::baseline::PlanSlot::Baseline(n).name()).changed() {
+                                    if shown {
+                                        st.gantt.multi_baselines |= 1u16 << n;
+                                    } else {
+                                        st.gantt.multi_baselines &= !(1u16 << n);
+                                    }
+                                }
+                            }
+                        },
+                    );
+                });
+            }
             let g = &mut st.gantt;
+            group(ui, crate::tr("Baseline"), |ui| {
+                egui::ComboBox::from_id_salt("baseline_slot_picker")
+                    .selected_text(plancraft_core::baseline::PlanSlot::Baseline(g.baseline_slot).name())
+                    .show_ui(ui, |ui| {
+                        for n in 0..=plancraft_core::baseline::MAX_BASELINE {
+                            ui.selectable_value(&mut g.baseline_slot, n, plancraft_core::baseline::PlanSlot::Baseline(n).name());
+                        }
+                    });
+            });
             group(ui, crate::tr("Bar Styles"), |ui| {
                 stack(ui, |ui| {
                     ui.checkbox(&mut g.show_critical, crate::tr("Critical Tasks"));
@@ -1100,6 +1153,7 @@ mod responsive_tests {
             resource_selected: true,
             mcp_running: false,
             mcp_url: None,
+            fields: Vec::new(),
         };
         for tab in MenuTab::ALL {
             state.menu_tab = tab;

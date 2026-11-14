@@ -1,10 +1,12 @@
 //! Main views.
 
+pub mod board;
 pub mod calendar;
 pub mod gantt;
 mod gantt_cells;
 pub mod gantt_chart;
 pub mod milestones;
+pub mod network;
 pub mod print_gantt;
 pub mod resource_sheet;
 pub mod resource_usage;
@@ -14,16 +16,47 @@ pub mod timeline;
 pub mod timesheet;
 pub mod workload;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use plancraft_core::prelude::*;
 
 use crate::columns;
+use crate::fields::{Field, SortKey};
 use crate::state::{Selection, TaskFilter, TaskGroup, UiState};
 
-/// The task shown on display row `row`, where `rows` maps rows to task indices.
-pub fn task_at<'a>(p: &'a Project, rows: &[usize], row: usize) -> Option<&'a Task> {
-    rows.get(row).and_then(|&i| p.tasks.get(i))
+/// One row of a task view: a task, or the header of a group when tasks are grouped by a field.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Row {
+    Task(usize),
+    Group(GroupRow),
+}
+
+/// A group header: the shared value and the tasks under it (task indices, in display order).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupRow {
+    pub label: String,
+    pub tasks: Vec<usize>,
+    pub collapsed: bool,
+}
+
+impl Row {
+    /// The task index of a task row.
+    pub fn task(&self) -> Option<usize> {
+        match self {
+            Row::Task(i) => Some(*i),
+            Row::Group(_) => None,
+        }
+    }
+}
+
+/// The task shown on display row `row` (`None` for group headers and blank rows).
+pub fn task_at<'a>(p: &'a Project, rows: &[Row], row: usize) -> Option<&'a Task> {
+    rows.get(row).and_then(Row::task).and_then(|i| p.tasks.get(i))
+}
+
+/// The display row of the task at index `idx`, if it is shown.
+pub fn row_of_task(rows: &[Row], idx: usize) -> Option<usize> {
+    rows.iter().position(|r| r.task() == Some(idx))
 }
 
 pub fn matches_filter(p: &Project, t: &Task, f: TaskFilter, value: f64) -> bool {
@@ -51,42 +84,238 @@ pub fn matches_filter(p: &Project, t: &Task, f: TaskFilter, value: f64) -> bool 
     }
 }
 
-/// Display rows at or above this index are group headers ("Group by"), not tasks.
-pub const GROUP_BASE: usize = usize::MAX / 2;
+/// Whether a task passes the view's filter and search text.
+pub fn task_matches(p: &Project, st: &UiState, t: &Task) -> bool {
+    let search = st.search.trim().to_lowercase();
+    matches_filter(p, t, st.filter, crate::format::parse_money(&st.filter_value).unwrap_or(0.0))
+        && (search.is_empty() || t.name.to_lowercase().contains(&search))
+}
 
-/// A group header row of a grouped task view.
-#[derive(Clone, Debug, Default)]
+/// Orders task indices by the sort field (ties keep outline order; empty values stay last in
+/// either direction).
+fn sort_indices(p: &Project, items: &mut [usize], field: &Field, descending: bool) {
+    let keys: HashMap<usize, SortKey> = items.iter().map(|&i| (i, field.sort_key(p, i))).collect();
+    items.sort_by(|a, b| {
+        let (ka, kb) = (keys.get(a).unwrap_or(&SortKey::Missing), keys.get(b).unwrap_or(&SortKey::Missing));
+        let missing = (matches!(ka, SortKey::Missing), matches!(kb, SortKey::Missing));
+        let ord = match missing {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ if descending => kb.cmp(ka),
+            _ => ka.cmp(kb),
+        };
+        ord.then(a.cmp(b))
+    });
+}
+
+/// Rows shown in task views, honoring the filter and search text, the sort (within the outline:
+/// subtasks stay under their summary), grouping (subtasks under group headers) and collapsed
+/// summaries and groups.
+pub fn visible_rows(p: &Project, st: &UiState) -> Vec<Row> {
+    if let Some(group) = TaskGroup::ALL.into_iter().find(|g| g.key().is_some() && g.key() == st.group.as_deref()) {
+        return legacy_grouped_rows(p, st, group);
+    }
+    let search = st.search.trim().to_lowercase();
+    let filtering = st.filter != TaskFilter::All || !search.is_empty();
+    let matches = |t: &Task| {
+        matches_filter(p, t, st.filter, crate::format::parse_money(&st.filter_value).unwrap_or(0.0))
+            && (search.is_empty() || t.name.to_lowercase().contains(&search))
+    };
+    let sort = st.sort.as_ref().and_then(|(k, desc)| Field::from_key(p, k).map(|f| (f, *desc)));
+
+    if let Some(group) = st.group.as_ref().and_then(|k| Field::from_key(p, k)) {
+        // Grouped: subtasks only, under one header per value.
+        let mut tasks: Vec<usize> =
+            p.tasks.iter().enumerate().filter(|(_, t)| !t.sched.is_summary && (!filtering || matches(t))).map(|(i, _)| i).collect();
+        if let Some((field, desc)) = &sort {
+            sort_indices(p, &mut tasks, field, *desc);
+        }
+        let mut groups: Vec<(SortKey, GroupRow)> = Vec::new();
+        let mut by_label: HashMap<String, usize> = HashMap::new();
+        for i in tasks {
+            let label = group.group_label(p, i);
+            let key = group.sort_key(p, i);
+            let slot = *by_label.entry(label.clone()).or_insert_with(|| {
+                groups.push((
+                    key.clone(),
+                    GroupRow { label: label.clone(), tasks: Vec::new(), collapsed: st.collapsed_groups.contains(&label) },
+                ));
+                groups.len().saturating_sub(1)
+            });
+            if let Some((k, g)) = groups.get_mut(slot) {
+                if key.cmp(k) == std::cmp::Ordering::Less {
+                    *k = key;
+                }
+                g.tasks.push(i);
+            }
+        }
+        groups.sort_by(|(ka, a), (kb, b)| ka.cmp(kb).then_with(|| a.label.cmp(&b.label)));
+        let mut rows = Vec::new();
+        for (_, g) in groups {
+            let shown = if g.collapsed { Vec::new() } else { g.tasks.clone() };
+            rows.push(Row::Group(g));
+            rows.extend(shown.into_iter().map(Row::Task));
+        }
+        return rows;
+    }
+
+    outline_rows(p, st)
+}
+
+/// Rows of the outline (no grouping), honoring the filter and search text, the sort within the
+/// outline and collapsed summaries.
+pub fn outline_rows(p: &Project, st: &UiState) -> Vec<Row> {
+    let search = st.search.trim().to_lowercase();
+    let filtering = st.filter != TaskFilter::All || !search.is_empty();
+    let matches = |t: &Task| {
+        matches_filter(p, t, st.filter, crate::format::parse_money(&st.filter_value).unwrap_or(0.0))
+            && (search.is_empty() || t.name.to_lowercase().contains(&search))
+    };
+    let sort = st.sort.as_ref().and_then(|(k, desc)| Field::from_key(p, k).map(|f| (f, *desc)));
+    let mut keep: Vec<bool> = vec![!filtering; p.tasks.len()];
+    if filtering {
+        for (i, t) in p.tasks.iter().enumerate() {
+            if !matches(t) {
+                continue;
+            }
+            // Keep summary rows above matches as context, like "show related summary rows".
+            let mut a = Some(i);
+            while let Some(ai) = a {
+                if let Some(k) = keep.get_mut(ai) {
+                    *k = true;
+                }
+                a = p.parent_index(ai);
+            }
+        }
+    }
+    // Children of each row (and the top level), from one pass over outline levels.
+    let mut roots: Vec<usize> = Vec::new();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); p.tasks.len()];
+    let mut stack: Vec<(usize, u16)> = Vec::new();
+    for (i, t) in p.tasks.iter().enumerate() {
+        while stack.last().is_some_and(|&(_, lvl)| lvl >= t.outline_level) {
+            stack.pop();
+        }
+        match stack.last().and_then(|&(pi, _)| children.get_mut(pi)) {
+            Some(list) => list.push(i),
+            None => roots.push(i),
+        }
+        stack.push((i, t.outline_level));
+    }
+    if let Some((field, desc)) = &sort {
+        sort_indices(p, &mut roots, field, *desc);
+        for list in &mut children {
+            sort_indices(p, list, field, *desc);
+        }
+    }
+    let mut rows = Vec::with_capacity(p.tasks.len());
+    let mut todo: Vec<usize> = roots.into_iter().rev().collect();
+    while let Some(i) = todo.pop() {
+        if st.show_level > 0 && p.tasks.get(i).is_some_and(|t| t.outline_level > st.show_level) {
+            continue;
+        }
+        if !keep.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        rows.push(Row::Task(i));
+        let collapsed = p.tasks.get(i).is_some_and(|t| st.collapsed.contains(&t.id));
+        if !collapsed && let Some(kids) = children.get(i) {
+            todo.extend(kids.iter().rev());
+        }
+    }
+    rows
+}
+
+/// Applies a click on `row` to the task selection. A group header selects the tasks under it.
+pub fn select_row(sel: &mut Selection, p: &Project, rows: &[Row], row: usize, shift: bool, ctrl: bool) {
+    if let Some(Row::Group(g)) = rows.get(row) {
+        if !ctrl {
+            sel.tasks.clear();
+        }
+        sel.tasks.extend(g.tasks.iter().filter_map(|&i| p.tasks.get(i)).map(|t| t.id));
+        return;
+    }
+    let Some(id) = task_at(p, rows, row).map(|t| t.id) else { return };
+    if shift && let Some(anchor) = sel.anchor {
+        let a = rows.iter().position(|r| task_at(p, std::slice::from_ref(r), 0).is_some_and(|t| t.id == anchor)).unwrap_or(row);
+        let (lo, hi) = if a <= row { (a, row) } else { (row, a) };
+        if !ctrl {
+            sel.tasks.clear();
+        }
+        for r in rows.iter().take(hi + 1).skip(lo) {
+            if let Some(t) = r.task().and_then(|i| p.tasks.get(i)) {
+                sel.tasks.insert(t.id);
+            }
+        }
+    } else if ctrl {
+        if !sel.tasks.remove(&id) {
+            sel.tasks.insert(id);
+        }
+        sel.anchor = Some(id);
+    } else {
+        sel.select_task(id);
+    }
+}
+
+/// Selected task ids in outline order.
+pub fn selected_in_order(p: &Project, sel: &Selection) -> Vec<TaskId> {
+    p.tasks.iter().filter(|t| sel.tasks.contains(&t.id)).map(|t| t.id).collect()
+}
+
+/// Task ids that have an assignment to an overallocated resource.
+pub fn overallocated_tasks(p: &Project, over: &HashSet<ResourceId>) -> HashSet<TaskId> {
+    if over.is_empty() {
+        return HashSet::new();
+    }
+    p.assignments.iter().filter(|a| over.contains(&a.resource)).map(|a| a.task).collect()
+}
+
 pub struct GroupHeader {
+    #[cfg(test)]
+    pub tasks: usize,
     pub label: String,
     pub start: Option<chrono::NaiveDateTime>,
     pub finish: Option<chrono::NaiveDateTime>,
-    pub cost: f64,
-    pub work: Minutes,
-    pub percent: f32,
-    pub tasks: usize,
 }
 
-thread_local! {
-    /// Headers of the last grouped `visible_rows` (row `GROUP_BASE + i` is header `i`).
-    static GROUP_HEADERS: std::cell::RefCell<Vec<GroupHeader>> = const { std::cell::RefCell::new(Vec::new()) };
+pub fn group_header(p: &Project, row: &Row) -> Option<GroupHeader> {
+    let Row::Group(g) = row else { return None };
+    Some(GroupHeader {
+        #[cfg(test)]
+        tasks: g.tasks.len(),
+        label: g.label.clone(),
+        start: g.tasks.iter().filter_map(|&i| p.tasks.get(i)?.sched.start).min(),
+        finish: g.tasks.iter().filter_map(|&i| p.tasks.get(i)?.sched.finish).max(),
+    })
 }
 
-/// The group header shown on display row index `idx`, if it is one.
-pub fn group_header(idx: usize) -> Option<GroupHeader> {
-    let i = idx.checked_sub(GROUP_BASE)?;
-    GROUP_HEADERS.with(|h| h.borrow().get(i).cloned())
-}
-
-/// Task indices shown in task views, honoring collapsed summaries, the filter and search text.
-/// With "Group by", group headers (indices from `GROUP_BASE`) are interleaved.
-pub fn visible_rows(p: &Project, st: &UiState) -> Vec<usize> {
-    if st.group != TaskGroup::None {
-        return grouped_rows(p, st);
+fn legacy_grouped_rows(p: &Project, st: &UiState, group: TaskGroup) -> Vec<Row> {
+    let search = st.search.trim().to_lowercase();
+    let value = plancraft_core::i18n::parse_f64(&st.filter_value).unwrap_or(0.0);
+    let mut groups: std::collections::BTreeMap<(i64, String), Vec<usize>> = Default::default();
+    for row in outline_rows(p, st) {
+        let Some(i) = row.task() else { continue };
+        let Some(t) = p.tasks.get(i) else { continue };
+        if p.has_children(i) || !matches_filter(p, t, st.filter, value) {
+            continue;
+        }
+        if !search.is_empty() && !t.name.to_lowercase().contains(&search) {
+            continue;
+        }
+        for key in group_keys(p, t, group) {
+            groups.entry(key).or_default().push(i);
+        }
     }
-    visible_rows_ungrouped(p, st)
+    let mut rows = Vec::new();
+    for ((_, label), tasks) in groups {
+        let collapsed = st.collapsed_groups.contains(&label);
+        rows.push(Row::Group(GroupRow { label, tasks: tasks.clone(), collapsed }));
+        if !collapsed {
+            rows.extend(tasks.into_iter().map(Row::Task));
+        }
+    }
+    rows
 }
-
-/// Group keys of a task: (order, label) for each group it belongs to.
 fn group_keys(p: &Project, t: &Task, g: TaskGroup) -> Vec<(i64, String)> {
     let field = |name: &str, value: String| format!("{}: {}", crate::tr_dyn(name), value);
     let yes_no = |b: bool| if b { crate::tr("Yes").to_string() } else { crate::tr("No").to_string() };
@@ -138,179 +367,6 @@ fn group_keys(p: &Project, t: &Task, g: TaskGroup) -> Vec<(i64, String)> {
     }
 }
 
-/// Rows of a grouped view: subtasks (no summaries) under one header per group value, like
-/// Microsoft Project's "Group by". A task assigned to several resources appears in each group.
-fn grouped_rows(p: &Project, st: &UiState) -> Vec<usize> {
-    let search = st.search.trim().to_lowercase();
-    let value = plancraft_core::i18n::parse_f64(&st.filter_value).unwrap_or(0.0);
-    let mut groups: std::collections::BTreeMap<(i64, String), Vec<usize>> = std::collections::BTreeMap::new();
-    for i in display_order(p, st.sort) {
-        let Some(t) = p.tasks.get(i) else { continue };
-        if p.has_children(i) || !matches_filter(p, t, st.filter, value) {
-            continue;
-        }
-        if !search.is_empty() && !t.name.to_lowercase().contains(&search) {
-            continue;
-        }
-        for key in group_keys(p, t, st.group) {
-            groups.entry(key).or_default().push(i);
-        }
-    }
-    let mut headers = Vec::with_capacity(groups.len());
-    let mut rows = Vec::new();
-    for ((_, label), members) in groups {
-        let mut h = GroupHeader { label: label.clone(), tasks: members.len(), ..Default::default() };
-        let (mut pw, mut pd) = (0.0f64, 0.0f64);
-        for &i in &members {
-            let Some(t) = p.tasks.get(i) else { continue };
-            h.start = match (h.start, t.sched.start) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-            h.finish = match (h.finish, t.sched.finish) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
-            h.cost += t.sched.cost;
-            h.work += t.sched.work;
-            let w = t.sched.duration.max(1) as f64;
-            pw += w * f64::from(t.sched.percent_complete);
-            pd += w;
-        }
-        h.percent = if pd > 0.0 { (pw / pd) as f32 } else { 0.0 };
-        rows.push(GROUP_BASE + headers.len());
-        headers.push(h);
-        if !st.collapsed_groups.contains(&label) {
-            rows.extend(members);
-        }
-    }
-    GROUP_HEADERS.with(|g| *g.borrow_mut() = headers);
-    rows
-}
-
-/// Task indices shown in task views without grouping (Task Usage, reports).
-pub fn visible_rows_ungrouped(p: &Project, st: &UiState) -> Vec<usize> {
-    let search = st.search.trim().to_lowercase();
-    let filtering = st.filter != TaskFilter::All || !search.is_empty();
-    let value = plancraft_core::i18n::parse_f64(&st.filter_value).unwrap_or(0.0);
-    let mut keep: Vec<bool> = vec![!filtering; p.tasks.len()];
-    if filtering {
-        for (i, t) in p.tasks.iter().enumerate() {
-            let ok = matches_filter(p, t, st.filter, value) && (search.is_empty() || t.name.to_lowercase().contains(&search));
-            if !ok {
-                continue;
-            }
-            // Keep summary rows above matches as context, like "show related summary rows".
-            let mut a = Some(i);
-            while let Some(ai) = a {
-                if let Some(k) = keep.get_mut(ai) {
-                    *k = true;
-                }
-                a = p.parent_index(ai);
-            }
-        }
-    }
-    let mut rows = Vec::with_capacity(p.tasks.len());
-    let mut skip_deeper: Option<u16> = None;
-    for i in display_order(p, st.sort) {
-        let Some(t) = p.tasks.get(i) else { continue };
-        if st.show_level > 0 && t.outline_level > st.show_level {
-            continue;
-        }
-        if let Some(lvl) = skip_deeper {
-            if t.outline_level > lvl {
-                continue;
-            }
-            skip_deeper = None;
-        }
-        if !keep.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        rows.push(i);
-        if st.collapsed.contains(&t.id) && p.has_children(i) {
-            skip_deeper = Some(t.outline_level);
-        }
-    }
-    rows
-}
-
-/// Task indices in display order: outline order, or siblings sorted by `key` (keeping each
-/// summary's subtasks under it, like Microsoft Project's "Keep outline structure").
-pub fn display_order(p: &Project, key: plancraft_core::extras::SortKey) -> Vec<usize> {
-    use plancraft_core::extras::SortKey;
-    if key == SortKey::Id {
-        return (0..p.tasks.len()).collect();
-    }
-    // Children of each row (None = top level).
-    let mut children: std::collections::HashMap<Option<usize>, Vec<usize>> = std::collections::HashMap::new();
-    for i in 0..p.tasks.len() {
-        children.entry(p.parent_index(i)).or_default().push(i);
-    }
-    let cmp = |a: &usize, b: &usize| -> std::cmp::Ordering {
-        let (Some(x), Some(y)) = (p.tasks.get(*a), p.tasks.get(*b)) else { return std::cmp::Ordering::Equal };
-        let o = match key {
-            SortKey::Cost => y.sched.cost.total_cmp(&x.sched.cost),
-            SortKey::Name => x.name.to_lowercase().cmp(&y.name.to_lowercase()),
-            SortKey::Start => x.sched.start.cmp(&y.sched.start),
-            SortKey::Finish => x.sched.finish.cmp(&y.sched.finish),
-            SortKey::Duration => y.sched.duration.cmp(&x.sched.duration),
-            SortKey::Work => y.sched.work.cmp(&x.sched.work),
-            SortKey::Priority => y.priority.cmp(&x.priority),
-            SortKey::Id => std::cmp::Ordering::Equal,
-        };
-        o.then(a.cmp(b))
-    };
-    for v in children.values_mut() {
-        v.sort_by(cmp);
-    }
-    let mut out = Vec::with_capacity(p.tasks.len());
-    let mut stack: Vec<usize> = children.get(&None).map(|v| v.iter().rev().copied().collect()).unwrap_or_default();
-    while let Some(i) = stack.pop() {
-        out.push(i);
-        if let Some(c) = children.get(&Some(i)) {
-            stack.extend(c.iter().rev().copied());
-        }
-    }
-    out
-}
-
-/// Applies a click on `row` to the task selection.
-pub fn select_row(sel: &mut Selection, p: &Project, rows: &[usize], row: usize, shift: bool, ctrl: bool) {
-    let Some(id) = task_at(p, rows, row).map(|t| t.id) else { return };
-    if shift && let Some(anchor) = sel.anchor {
-        let a = rows.iter().position(|&i| p.tasks.get(i).is_some_and(|t| t.id == anchor)).unwrap_or(row);
-        let (lo, hi) = if a <= row { (a, row) } else { (row, a) };
-        if !ctrl {
-            sel.tasks.clear();
-        }
-        for i in rows.iter().take(hi + 1).skip(lo) {
-            if let Some(t) = p.tasks.get(*i) {
-                sel.tasks.insert(t.id);
-            }
-        }
-    } else if ctrl {
-        if !sel.tasks.remove(&id) {
-            sel.tasks.insert(id);
-        }
-        sel.anchor = Some(id);
-    } else {
-        sel.select_task(id);
-    }
-}
-
-/// Selected task ids in outline order.
-pub fn selected_in_order(p: &Project, sel: &Selection) -> Vec<TaskId> {
-    p.tasks.iter().filter(|t| sel.tasks.contains(&t.id)).map(|t| t.id).collect()
-}
-
-/// Task ids that have an assignment to an overallocated resource.
-pub fn overallocated_tasks(p: &Project, over: &HashSet<ResourceId>) -> HashSet<TaskId> {
-    if over.is_empty() {
-        return HashSet::new();
-    }
-    p.assignments.iter().filter(|a| over.contains(&a.resource)).map(|a| a.task).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,15 +389,79 @@ mod tests {
         let rows = visible_rows(&p, &st);
         // 4 milestones plus their 4 summary parents.
         assert_eq!(rows.len(), 8);
-        assert!(rows.iter().all(|&i| p.tasks[i].is_milestone() || p.tasks[i].sched.is_summary));
+        assert!(rows.iter().filter_map(Row::task).all(|i| p.tasks[i].is_milestone() || p.tasks[i].sched.is_summary));
+    }
+
+    #[test]
+    fn sorting_keeps_subtasks_under_their_summary() {
+        let p = demo();
+        let mut st = UiState { sort: Some(("duration".into(), true)), ..UiState::default() };
+        let rows = visible_rows(&p, &st);
+        assert_eq!(rows.len(), p.tasks.len(), "sorting hides nothing");
+        // Each subtask still follows its own summary, and siblings run longest first.
+        let order: Vec<usize> = rows.iter().filter_map(Row::task).collect();
+        for (pos, &i) in order.iter().enumerate() {
+            if let Some(parent) = p.parent_index(i) {
+                let ppos = order.iter().position(|&x| x == parent).unwrap();
+                assert!(ppos < pos, "{} shown before its summary", p.tasks[i].name);
+                assert!(order[ppos..pos].iter().all(|&x| x == parent || p.parent_index(x).is_some()), "subtasks stay inside their summary");
+            }
+        }
+        for parent in (0..p.tasks.len()).filter(|&i| p.has_children(i)) {
+            let kids: Vec<usize> = order.iter().copied().filter(|&x| p.parent_index(x) == Some(parent)).collect();
+            assert!(kids.windows(2).all(|w| p.tasks[w[0]].sched.duration >= p.tasks[w[1]].sched.duration), "{}", p.tasks[parent].name);
+        }
+        st.sort = Some(("duration".into(), false));
+        let asc: Vec<usize> = visible_rows(&p, &st).iter().filter_map(Row::task).collect();
+        assert_ne!(asc, order);
+    }
+
+    #[test]
+    fn grouping_by_a_custom_field_lists_subtasks_under_headers() {
+        let p = demo();
+        let status = p.find_custom_field("Status").unwrap().id;
+        let mut st = UiState { group: Some(plancraft_core::custom::custom_column_key(status)), ..UiState::default() };
+        let rows = visible_rows(&p, &st);
+        let groups: Vec<&GroupRow> = rows.iter().filter_map(|r| if let Row::Group(g) = r { Some(g) } else { None }).collect();
+        let labels: Vec<&str> = groups.iter().map(|g| g.label.as_str()).collect();
+        assert_eq!(labels, ["Done", "In progress", "To do", "No value"], "groups in value order, blanks last");
+        let mut seen = 0;
+        for g in &groups {
+            for &i in &g.tasks {
+                let t = &p.tasks[i];
+                assert!(!t.sched.is_summary, "summaries are not grouped");
+                let v = t.custom.get(&status).map(|v| p.custom_value_text(status, v));
+                assert_eq!(v.as_deref().unwrap_or("No value"), g.label);
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, p.tasks.iter().filter(|t| !t.sched.is_summary).count());
+        // A collapsed group shows its header only.
+        st.collapsed_groups.insert("To do".into());
+        let rows = visible_rows(&p, &st);
+        let todo = rows.iter().position(|r| matches!(r, Row::Group(g) if g.label == "To do")).unwrap();
+        assert!(matches!(rows.get(todo + 1), Some(Row::Group(_))), "no task rows under a collapsed group");
+    }
+
+    #[test]
+    fn pick_list_cells_set_and_clear_values() {
+        let mut p = demo();
+        let risk = p.find_custom_field("Risk").unwrap().id;
+        let id = p.tasks[1].id;
+        let field = crate::fields::Field::Custom(risk);
+        field.commit(&mut p, id, "High").unwrap();
+        assert_eq!(p.task(id).unwrap().custom.get(&risk), Some(&CustomValue::Text("High".into())));
+        assert!(field.commit(&mut p, id, "Severe").is_err());
+        field.commit(&mut p, id, crate::fields::NO_VALUE).unwrap();
+        assert!(!p.task(id).unwrap().custom.contains_key(&risk));
     }
 
     #[test]
     fn group_by_adds_headers() {
         let p = demo();
-        let mut st = UiState { group: TaskGroup::Critical, ..Default::default() };
+        let mut st = UiState { group: TaskGroup::Critical.key().map(str::to_string), ..Default::default() };
         let rows = visible_rows(&p, &st);
-        let headers: Vec<GroupHeader> = rows.iter().filter_map(|&r| group_header(r)).collect();
+        let headers: Vec<GroupHeader> = rows.iter().filter_map(|r| group_header(&p, r)).collect();
         assert!(!headers.is_empty() && headers.len() <= 2);
         let leaves = (0..p.tasks.len()).filter(|&i| !p.has_children(i)).count();
         assert_eq!(rows.len(), leaves + headers.len());
@@ -351,10 +471,10 @@ mod tests {
         assert_eq!(visible_rows(&p, &st).len(), leaves + headers.len() - headers[0].tasks);
         // Grouping by resource can repeat a task under each of its resources.
         st.collapsed_groups.clear();
-        st.group = TaskGroup::Resource;
-        assert!(visible_rows(&p, &st).iter().any(|&r| r >= GROUP_BASE));
+        st.group = TaskGroup::Resource.key().map(str::to_string);
+        assert!(visible_rows(&p, &st).iter().any(|r| matches!(r, Row::Group(_))));
         for g in TaskGroup::ALL {
-            st.group = g;
+            st.group = g.key().map(str::to_string);
             let _ = visible_rows(&p, &st);
         }
     }

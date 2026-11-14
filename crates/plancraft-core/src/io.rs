@@ -31,6 +31,24 @@ pub enum FileError {
     TooLarge { path: PathBuf, size: u64 },
     #[error("{path} cannot be opened: {message}")]
     Limit { path: PathBuf, message: String },
+    #[error("{path} was changed by another program since it was opened or last saved")]
+    ChangedOnDisk { path: PathBuf },
+    #[error("{path} could not be imported: {message}")]
+    Import { path: PathBuf, message: String },
+}
+
+/// What a file looked like on disk (modification time and size), to notice when another program
+/// rewrites a document between our load or save and the next save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+/// The file's current stamp, or `None` when it does not exist or cannot be read.
+pub fn disk_stamp(path: impl AsRef<Path>) -> Option<DiskStamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(DiskStamp { modified: m.modified().ok(), len: m.len() })
 }
 
 pub type FileResult<T> = Result<T, FileError>;
@@ -67,7 +85,31 @@ pub fn from_json_with_notes(text: &str, path: &Path) -> FileResult<(Project, Vec
     if version > FILE_VERSION {
         return Err(FileError::TooNew { path: path.into(), version });
     }
-    let mut p: Project = serde_json::from_str(text).map_err(|source| FileError::Parse { path: path.into(), source })?;
+    // Upstream uses `recurrence` for its newer pattern. Our older edition already used that
+    // key for a different definition, which stays intact alongside `recurrence_pattern`.
+    let mut p: Project = match serde_json::from_str(text) {
+        Ok(project) => project,
+        Err(original_error) => {
+            let mut value: serde_json::Value =
+                serde_json::from_str(text).map_err(|source| FileError::Parse { path: path.into(), source })?;
+            let mut migrated = false;
+            if let Some(tasks) = value.get_mut("tasks").and_then(serde_json::Value::as_array_mut) {
+                for task in tasks {
+                    if task.get("recurrence").and_then(|r| r.get("pattern")).is_some()
+                        && let Some(obj) = task.as_object_mut()
+                        && let Some(pattern) = obj.remove("recurrence")
+                    {
+                        obj.entry("recurrence_pattern").or_insert(pattern);
+                        migrated = true;
+                    }
+                }
+            }
+            if !migrated {
+                return Err(FileError::Parse { path: path.into(), source: original_error });
+            }
+            serde_json::from_value(value).map_err(|source| FileError::Parse { path: path.into(), source })?
+        }
+    };
     limits::check_counts(&p).map_err(|e| FileError::Limit { path: path.into(), message: e.to_string() })?;
     p.version = FILE_VERSION;
     // Keep id counters ahead of every stored id (hand-edited files may lag behind).
@@ -76,6 +118,13 @@ pub fn from_json_with_notes(text: &str, path: &Path) -> FileResult<(Project, Vec
     p.ids.calendar = p.ids.calendar.max(p.calendars.iter().map(|c| c.id.0).max().unwrap_or(0));
     p.ids.assignment = p.ids.assignment.max(p.assignments.iter().map(|a| a.id.0).max().unwrap_or(0));
     p.ids.time_entry = p.ids.time_entry.max(p.time_entries.iter().map(|e| e.id.0).max().unwrap_or(0));
+    // Plans saved before the Task Board existed get its default columns, numbered from 1 (no
+    // column exists yet, so whatever the stored counter says, these ids are free and in range).
+    if p.board_columns.is_empty() {
+        let mut fresh = crate::ids::IdCounters::default();
+        p.board_columns = crate::board::default_columns(&mut fresh);
+    }
+    p.ids.board_column = p.ids.board_column.max(p.board_columns.iter().map(|c| c.id.0).max().unwrap_or(0));
     if p.calendars.is_empty() {
         let id = p.ids.next_calendar();
         p.calendars.push(crate::calendar::Calendar::standard(id));
@@ -94,6 +143,11 @@ pub fn load(path: impl AsRef<Path>) -> FileResult<Project> {
 pub fn load_with_notes(path: impl AsRef<Path>) -> FileResult<(Project, Vec<String>)> {
     let path = path.as_ref();
     let io_err = |source| FileError::Io { path: path.into(), source };
+    // Only regular files: opening a FIFO or device blocks or never ends (a hostile link or
+    // argument must not hang the app or the MCP server).
+    if !std::fs::metadata(path).map_err(io_err)?.is_file() {
+        return Err(io_err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")));
+    }
     let file = std::fs::File::open(path).map_err(io_err)?;
     let size = file.metadata().map_err(io_err)?.len();
     if size > MAX_FILE_BYTES {
@@ -343,14 +397,37 @@ pub fn external_task_list(p: &Project, doc_path: Option<&Path>, project: Uuid) -
     Ok(other.tasks.iter().map(snapshot).collect())
 }
 
-/// Refreshes the cached dates of every referenced external task. Returns warnings.
+/// Whether a stored link path names a network share or device namespace (`\\server\share`,
+/// `//server/share`, `\\?\…`). Following one makes Windows connect to that server and offer the
+/// user's credentials, so a document from someone else must not trigger it just by being opened.
+pub fn is_network_path(stored: &str) -> bool {
+    let s = stored.trim_start();
+    s.starts_with("\\\\") || s.starts_with("//") || s.starts_with("\\/") || s.starts_with("/\\")
+}
+
+/// Refreshes the cached dates of every referenced external task (explicit Refresh Links: all
+/// links are followed). Returns warnings.
 pub fn refresh_external(p: &mut Project, doc_path: Option<&Path>) -> Vec<String> {
+    refresh_external_links(p, doc_path, true)
+}
+
+/// Refresh done automatically when a document opens: links to network shares are left for an
+/// explicit Refresh Links (see [`is_network_path`]).
+pub fn refresh_external_on_open(p: &mut Project, doc_path: Option<&Path>) -> Vec<String> {
+    refresh_external_links(p, doc_path, false)
+}
+
+fn refresh_external_links(p: &mut Project, doc_path: Option<&Path>, follow_network: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     let now = chrono::Local::now().naive_local();
     for i in 0..p.external_projects.len() {
         let Some((id, stored, name)) = p.external_projects.get(i).map(|e| (e.id, e.path.clone(), e.name.clone())) else {
             continue;
         };
+        if !follow_network && is_network_path(&stored) {
+            warnings.push(format!("'{name}' is on a network share ({stored}); use Refresh Links to update it"));
+            continue;
+        }
         let wanted = referenced_external_tasks(p, id);
         let path = resolve_external_path(&stored, doc_path);
         match load(&path) {
@@ -387,6 +464,45 @@ pub fn refresh_external(p: &mut Project, doc_path: Option<&Path>) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: opening a document read every path in its external links. A FIFO or device
+    /// path blocked forever, and on Windows a `\\\\server\\share` path made the machine connect to
+    /// that server (offering the user's credentials) just because a file was opened.
+    #[test]
+    fn hostile_link_paths_are_not_followed_on_open() {
+        for net in ["\\\\attacker\\share\\x.plancraft", "//attacker/share/x.plancraft", " \\\\?\\UNC\\host\\x", "\\/host/x", "/\\host\\x"] {
+            assert!(is_network_path(net), "{net}");
+        }
+        for local in ["other.plancraft", "../plans/b.plancraft", "/home/u/b.plancraft", "C:\\plans\\b.plancraft"] {
+            assert!(!is_network_path(local), "{local}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Project::new("A", chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap());
+        p.external_projects.push(ExternalProject {
+            id: Uuid::new_v4(),
+            name: "Remote".into(),
+            path: "\\\\attacker\\share\\x.plancraft".into(),
+            tasks: Vec::new(),
+            last_sync: None,
+        });
+        let doc = dir.path().join("a.plancraft");
+        let w = refresh_external_on_open(&mut p, Some(&doc));
+        assert!(w.len() == 1 && w[0].contains("network share"), "{w:?}");
+
+        // A directory, and on Unix a FIFO, is refused at once instead of blocking.
+        assert!(matches!(load(dir.path()), Err(FileError::Io { .. })));
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("pipe.plancraft");
+            if std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|s| s.success()) {
+                let started = std::time::Instant::now();
+                let e = load(&fifo).unwrap_err().to_string();
+                assert!(e.contains("not a regular file"), "{e}");
+                assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            }
+        }
+    }
 
     #[test]
     fn atomic_save_replaces_and_leaves_no_temp_files() {

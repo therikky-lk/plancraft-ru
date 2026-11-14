@@ -46,6 +46,7 @@ pub struct ProjectInfo {
     critical_slack: String,
     from_finish: bool,
     finish: String,
+    ev_baseline: u8,
     error: Option<String>,
 }
 
@@ -76,6 +77,7 @@ impl ProjectInfo {
             critical_slack: p.format_duration(s.critical_slack, false),
             from_finish: s.schedule_from_finish,
             finish: s.finish_date.or(p.sched.finish).map(|d| format::edit_day(d.date())).unwrap_or_default(),
+            ev_baseline: s.earned_value_baseline,
             error: None,
         }
     }
@@ -123,7 +125,7 @@ impl ProjectInfo {
         if s.time.minutes_per_day <= 0 {
             return Err(crate::tr("Hours per day must be positive").into());
         }
-        Ok(())
+        p.set_earned_value_baseline(self.ev_baseline).map_err(|e| e.to_string())
     }
 
     pub fn show(&mut self, ctx: &Context, doc: &mut Document) -> bool {
@@ -219,6 +221,14 @@ impl ProjectInfo {
                             ui.end_row();
                             ui.label(crate::tr("Critical if slack ≤"));
                             ui.add(egui::TextEdit::singleline(&mut self.critical_slack).desired_width(60.0));
+                            ui.label("Earned value uses:");
+                            egui::ComboBox::from_id_salt("pi_ev_baseline")
+                                .selected_text(PlanSlot::Baseline(self.ev_baseline).name())
+                                .show_ui(ui, |ui| {
+                                    for n in 0..=plancraft_core::baseline::MAX_BASELINE {
+                                        ui.selectable_value(&mut self.ev_baseline, n, PlanSlot::Baseline(n).name());
+                                    }
+                                });
                             ui.end_row();
                         });
                         ui.add_space(4.0);

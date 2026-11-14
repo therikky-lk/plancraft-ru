@@ -144,8 +144,17 @@ pub fn task_row(p: &Project, idx: usize) -> Value {
     if t.sched.is_summary {
         m.insert("is_summary".into(), json!(true));
     }
+    if !t.custom.is_empty() {
+        m.insert("custom".into(), crate::tools::custom_fields::custom_values_json(p, t));
+    }
     if t.is_milestone() {
         m.insert("is_milestone".into(), json!(true));
+    }
+    if t.recurrence_pattern.is_some() || t.occurrence {
+        m.insert("recurring".into(), json!(true));
+    }
+    if !plancraft_core::schedule::planned_gaps(&t.gaps, t.duration).is_empty() {
+        m.insert("split".into(), json!(true));
     }
     if t.mode == ScheduleMode::Manual {
         m.insert("mode".into(), json!("manual"));
@@ -324,6 +333,11 @@ pub fn task_detail(p: &Project, id: TaskId) -> Value {
         "percent_complete_entered": t.percent_complete,
         "actual_start": fmt_dt(t.actual_start),
         "actual_finish": fmt_dt(t.actual_finish),
+        "actual_duration": dur(p, t.duration_progress().0),
+        "remaining_duration": dur(p, t.duration_progress().1),
+        "stop": fmt_dt(t.sched.stop),
+        "resume": fmt_dt(t.sched.resume),
+        "parts": t.sched.parts.iter().map(|&(a, b)| json!([fmt_dt(Some(a)), fmt_dt(Some(b))])).collect::<Vec<_>>(),
         "manual_start": fmt_dt(t.manual_start),
         "manual_finish": fmt_dt(t.manual_finish),
         "actual_work": format_work(t.sched.actual_work),
@@ -337,7 +351,10 @@ pub fn task_detail(p: &Project, id: TaskId) -> Value {
         "notes": t.notes,
         "deliverable": t.deliverable,
         "show_on_timeline": t.show_on_timeline,
+        "board_status": p.board_column_of(idx).filter(|_| !t.sched.is_summary).and_then(|c| p.board_column(c)).map(|c| c.name.clone()),
+        "show_on_board": t.show_on_board,
         "bar_color": t.bar_color.map(|c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])),
+        "custom": crate::tools::custom_fields::custom_values_json(p, t),
         "late": report::is_late(t, at, p),
         "parent": parent,
         "children": children,
@@ -350,6 +367,42 @@ pub fn task_detail(p: &Project, id: TaskId) -> Value {
         "baseline": variance_json(p, t),
         "warnings": t.sched.warnings,
     });
+    if !t.baselines.is_empty() {
+        let other: serde_json::Map<String, Value> = t
+            .baselines
+            .iter()
+            .map(|(n, b)| {
+                let v = json!({
+                    "start": fmt_dt(Some(b.start)), "finish": fmt_dt(Some(b.finish)), "duration": dur(p, b.duration),
+                    "work": format_work(b.work), "cost": round2(b.cost), "saved": fmt_dt(Some(b.saved)),
+                });
+                (plancraft_core::baseline::PlanSlot::Baseline(*n).key(), v)
+            })
+            .collect();
+        m.insert("other_baselines".into(), Value::Object(other));
+    }
+    if !t.gaps.is_empty() {
+        m.insert("planned_splits".into(), crate::tools::recurring::planned_splits_json(p, t));
+    }
+    if let Some(r) = &t.recurrence_pattern {
+        m.insert("recurrence".into(), crate::tools::recurring::recurrence_json(p, r));
+    }
+    if let Some(parent) = p.recurring_parent(idx).and_then(|i| p.tasks.get(i)) {
+        m.insert("occurrence_of".into(), json!({ "id": parent.id.0, "name": parent.name }));
+    }
+    if !t.interim.is_empty() {
+        let interim: serde_json::Map<String, Value> = t
+            .interim
+            .iter()
+            .map(|(n, i)| {
+                (
+                    plancraft_core::baseline::PlanSlot::Interim(*n).key(),
+                    json!({ "start": fmt_dt(Some(i.start)), "finish": fmt_dt(Some(i.finish)) }),
+                )
+            })
+            .collect();
+        m.insert("interim_plans".into(), Value::Object(interim));
+    }
     if let Value::Object(e) = extra {
         for (k, val) in e {
             m.insert(k, val);
@@ -506,6 +559,7 @@ pub fn settings_json(p: &Project) -> Value {
         "new_tasks_auto": s.new_tasks_auto,
         "use_resource_calendars": s.use_resource_calendars,
         "progress_from_time": s.progress_from_time,
+        "earned_value_baseline": plancraft_core::baseline::PlanSlot::Baseline(s.earned_value_baseline).name(),
     })
 }
 
@@ -550,6 +604,7 @@ pub fn earned_value_json(ev: &Option<report::EarnedValue>) -> Value {
             "cost_variance": round2(e.cv),
             "spi": round2(e.spi),
             "cpi": round2(e.cpi),
+            "baseline": plancraft_core::baseline::PlanSlot::Baseline(e.baseline).name(),
         }),
     }
 }

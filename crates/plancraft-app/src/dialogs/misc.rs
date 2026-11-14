@@ -61,8 +61,12 @@ impl AssignResources {
                         let text = self.units.entry(r.id).or_insert_with(|| current.unwrap_or_else(|| "100%".into()));
                         ui.add(egui::TextEdit::singleline(text).desired_width(56.0));
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(!tasks.is_empty(), egui::Button::new(if assigned_all { crate::tr("Update") } else { crate::tr("Assign") })).clicked() {
-                                actions.push((r.id, format::parse_units(text)));
+                            if ui.add_enabled(!tasks.is_empty(), egui::Button::new(if assigned_all { "Update" } else { "Assign" })).clicked() {
+                                // Bad text is an error, never a removal (None means "remove").
+                                match format::parse_units(text) {
+                                    Some(u) => actions.push((r.id, Some(u))),
+                                    None => st_toasts.push((ToastKind::Error, format!("'{}' is not a valid units value (try 50% or 100%)", text.trim()))),
+                                }
                             }
                             if assigned_all && ui.button(crate::tr("Remove")).clicked() {
                                 actions.push((r.id, None));
@@ -169,7 +173,8 @@ pub fn statistics(ctx: &Context, doc: &Document, open: &mut bool) {
             });
             if let Some(ev) = &s.earned_value {
                 ui.separator();
-                ui.label(RichText::new(crate::tr("Earned value (vs. baseline)")).strong());
+                let against = plancraft_core::baseline::PlanSlot::Baseline(ev.baseline).name();
+                ui.label(RichText::new(format!("Earned value (against {against})")).strong());
                 egui::Grid::new("stats_ev").num_columns(4).spacing([24.0, 4.0]).show(ui, |ui| {
                     ui.label(crate::tr("Planned value (BCWS)"));
                     ui.label(format::money(p, ev.bcws));
@@ -196,8 +201,9 @@ pub fn statistics(ctx: &Context, doc: &Document, open: &mut bool) {
                     ui.end_row();
                 });
             } else {
+                let against = plancraft_core::baseline::PlanSlot::Baseline(p.settings.earned_value_baseline).name();
                 ui.label(
-                    RichText::new(crate::tr("Set a baseline (Project > Set Baseline) to track variance and earned value."))
+                    RichText::new(format!("Save {against} (Project > Set Baseline) to track earned value; variance uses Baseline."))
                         .small()
                         .color(theme::pal().TEXT_WEAK),
                 );
@@ -461,4 +467,42 @@ pub fn templates(ctx: &Context, open: &mut bool, out: &mut Vec<crate::commands::
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use egui_kittest::kittest::Queryable;
+    use plancraft_core::workspace::Workspace;
+
+    /// Regression: unreadable Units text parsed as `None`, which the dialog treats as "remove",
+    /// so clicking Update with a typo deleted the assignment.
+    #[test]
+    fn bad_units_text_reports_an_error_and_keeps_the_assignment() {
+        let mut ws = Workspace::default();
+        ws.add(plancraft_core::sample::demo_project(NaiveDate::from_ymd_opt(2026, 10, 19).unwrap()), None);
+        let (task, res, name) = {
+            let p = &ws.docs[0].project;
+            let a = p.assignments.first().unwrap();
+            (a.task, a.resource, p.resource(a.resource).unwrap().name.clone())
+        };
+        let assignments = ws.docs[0].project.assignments.len();
+        let mut dialog = AssignResources { filter: name, ..Default::default() };
+        dialog.units.insert(res, "abc".into());
+        let sel = Selection { tasks: [task].into_iter().collect(), ..Default::default() };
+        let state = (ws, dialog, sel, Vec::new());
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 800.0)).build_ui_state(
+            |ui, (ws, dialog, sel, toasts): &mut (Workspace, AssignResources, Selection, Vec<(ToastKind, String)>)| {
+                dialog.show(ui.ctx(), &mut ws.docs[0], sel, toasts);
+            },
+            state,
+        );
+        h.run();
+        h.get_by_label("Update").click();
+        h.run();
+        let (ws, _, _, toasts) = h.state();
+        assert_eq!(ws.docs[0].project.assignments.len(), assignments, "the assignment is kept");
+        assert!(toasts.iter().any(|(k, m)| *k == ToastKind::Error && m.contains("abc")), "{toasts:?}");
+    }
 }

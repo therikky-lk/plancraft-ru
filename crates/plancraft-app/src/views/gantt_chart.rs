@@ -16,20 +16,63 @@ use crate::widgets::timescale;
 
 #[derive(Clone, Debug)]
 pub enum ChartAction {
-    Select { task: TaskId, shift: bool, ctrl: bool },
+    Select {
+        task: TaskId,
+        shift: bool,
+        ctrl: bool,
+    },
     Open(TaskId),
-    MoveTo { task: TaskId, start: NaiveDateTime },
-    SetFinish { task: TaskId, finish: NaiveDateTime },
-    SetProgress { task: TaskId, pct: u8 },
-    Link { from: TaskId, to: TaskId },
+    MoveTo {
+        task: TaskId,
+        start: NaiveDateTime,
+    },
+    SetFinish {
+        task: TaskId,
+        finish: NaiveDateTime,
+    },
+    SetProgress {
+        task: TaskId,
+        pct: u8,
+    },
+    Link {
+        from: TaskId,
+        to: TaskId,
+    },
+    /// Split Task: split the task at this moment.
+    Split {
+        task: TaskId,
+        at: NaiveDateTime,
+    },
+    /// Part `k` (from 1) of a split task now starts at `start`.
+    MovePart {
+        task: TaskId,
+        k: usize,
+        start: NaiveDateTime,
+    },
+    /// Part `k` (from 0, not the last) of a split task now ends at `finish`.
+    SetPartFinish {
+        task: TaskId,
+        k: usize,
+        finish: NaiveDateTime,
+    },
     Command(Command),
+}
+
+/// Which Gantt view the chart draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartKind {
+    Gantt,
+    /// Critical tasks in red, with the baseline under each bar.
+    Tracking,
+    /// Only the bars of the chosen baselines, stacked in each row ([`GanttState::multi_baselines`]).
+    Baselines,
 }
 
 pub struct ChartInput<'a> {
     pub project: &'a Project,
-    pub rows: &'a [usize],
+    pub rows: &'a [super::Row],
     pub selected: &'a dyn Fn(TaskId) -> bool,
-    pub tracking: bool,
+    pub kind: ChartKind,
     pub row_height: f32,
     pub header_height: f32,
     pub blank_rows: usize,
@@ -43,6 +86,68 @@ struct BarGeom {
 }
 
 const BAR_H: f32 = 10.0;
+
+/// The baselines in a bit set (bit n = Baseline n), lowest first.
+pub fn baseline_slots(mask: u16) -> impl Iterator<Item = u8> {
+    (0..=plancraft_core::baseline::MAX_BASELINE).filter(move |n| mask & (1 << n) != 0)
+}
+
+/// The bars of `slots` stacked in the row centred on `y` (Multiple Baselines Gantt). Returns the
+/// span drawn, for hit testing.
+fn baseline_stack(bp: &Painter, g: &GanttState, chart_left: f32, t: &Task, y: f32, rh: f32, slots: &[u8]) -> Option<Rect> {
+    // Fit the stack inside the row: gaps shrink first, then the bars.
+    let n = slots.len().max(1) as f32;
+    let band = (rh - 4.0).max(4.0);
+    let gap = if n > 5.0 { 0.5 } else { 1.0 };
+    let h = ((band - (n - 1.0) * gap) / n).clamp(0.8, 5.0);
+    let top = y - (h * n + (n - 1.0) * gap) / 2.0;
+    let mut span: Option<Rect> = None;
+    for (k, &slot) in slots.iter().enumerate() {
+        let Some(b) = t.baseline_in(slot) else { continue };
+        let color = theme::pal().BASELINE_SERIES.get(usize::from(slot)).copied().unwrap_or(theme::pal().BAR_BASELINE);
+        let y0 = top + k as f32 * (h + gap);
+        let (x0, x1) = (g.x_of(chart_left, b.start), g.x_of(chart_left, b.finish));
+        let r = if t.is_milestone() {
+            let r = (h / 2.0 + 1.0).max(2.5);
+            diamond(bp, pos2(x0, y0 + h / 2.0), r, color, Stroke::NONE);
+            Rect::from_center_size(pos2(x0, y0 + h / 2.0), vec2(2.0 * r, 2.0 * r))
+        } else {
+            let r = Rect::from_min_max(pos2(x0, y0), pos2(x1.max(x0 + 1.0), y0 + h));
+            bp.rect_filled(r, if t.sched.is_summary { 0.0 } else { 1.0 }, color);
+            r
+        };
+        span = Some(span.map_or(r, |s| s.union(r)));
+    }
+    span
+}
+
+/// The colour key of the Multiple Baselines Gantt, in the chart's bottom-right corner.
+fn baseline_legend(bp: &Painter, body: Rect, slots: &[u8]) {
+    let font = FontId::proportional(11.0);
+    let y = body.bottom() - 12.0;
+    // Right to left: (swatch x, label x, label, colour).
+    let mut items = Vec::new();
+    let mut x = body.right() - 10.0;
+    for &slot in slots.iter().rev() {
+        let name = plancraft_core::baseline::PlanSlot::Baseline(slot).name();
+        x -= bp.layout_no_wrap(name.clone(), font.clone(), theme::pal().TEXT).size().x;
+        let label_x = x;
+        x -= 14.0;
+        let color = theme::pal().BASELINE_SERIES.get(usize::from(slot)).copied().unwrap_or(theme::pal().BAR_BASELINE);
+        items.push((x, label_x, name, color));
+        x -= 12.0;
+    }
+    if items.is_empty() {
+        return;
+    }
+    let bg = Rect::from_min_max(pos2(x + 4.0, y - 9.0), pos2(body.right() - 4.0, y + 9.0));
+    bp.rect_filled(bg, 3.0, theme::pal().BG);
+    bp.rect_stroke(bg, 3.0, Stroke::new(1.0, theme::pal().GRID_LINE_STRONG), StrokeKind::Inside);
+    for (sx, lx, name, color) in items {
+        bp.rect_filled(Rect::from_min_size(pos2(sx, y - 3.0), vec2(10.0, 6.0)), 1.0, color);
+        bp.text(pos2(lx, y), Align2::LEFT_CENTER, name, font.clone(), theme::pal().TEXT);
+    }
+}
 
 fn diamond(painter: &Painter, c: Pos2, r: f32, fill: Color32, stroke: Stroke) {
     painter.add(Shape::convex_polygon(vec![c + vec2(0.0, -r), c + vec2(r, 0.0), c + vec2(0.0, r), c + vec2(-r, 0.0)], fill, stroke));
@@ -64,6 +169,9 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
     let mut actions = Vec::new();
     let p = input.project;
     let rh = input.row_height;
+    let tracking = input.kind == ChartKind::Tracking;
+    let multi = input.kind == ChartKind::Baselines;
+    let multi_slots: Vec<u8> = baseline_slots(g.multi_baselines).collect();
     let header = Rect::from_min_size(rect.min, vec2(rect.width() - 12.0, input.header_height));
     let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), pos2(rect.right() - 12.0, rect.bottom() - 12.0));
     let chart_left = body.left();
@@ -134,7 +242,7 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
             bp.rect_filled(Rect::from_min_size(pos2(body.left(), y), vec2(body.width(), rh)), 0.0, theme::pal().SELECTION_TINT);
         }
         // Group header ("Group by"): a band with a summary-style bar over the group's dates.
-        if let Some(h) = input.rows.get(r).and_then(|&i| super::group_header(i)) {
+        if let Some(h) = input.rows.get(r).and_then(|row| super::group_header(p, row)) {
             bp.rect_filled(Rect::from_min_size(pos2(body.left(), y), vec2(body.width(), rh)), 0.0, theme::pal().HEADER_BG);
             if let (Some(s), Some(f)) = (h.start, h.finish) {
                 let (x0, x1) = (g.x_of(chart_left, s), g.x_of(chart_left, f).max(g.x_of(chart_left, s) + 1.0));
@@ -163,7 +271,7 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
 
     // ---- Geometry for all rows (links need off-screen ones too) ----
     let mut geom: HashMap<TaskId, BarGeom> = HashMap::with_capacity(input.rows.len());
-    for (r, &idx) in input.rows.iter().enumerate() {
+    for (r, idx) in input.rows.iter().enumerate().filter_map(|(r, row)| row.task().map(|i| (r, i))) {
         let Some(t) = p.tasks.get(idx) else { continue };
         let (Some(s), Some(f)) = (t.sched.start, t.sched.finish) else {
             continue;
@@ -172,11 +280,10 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
         geom.insert(t.id, BarGeom { y, x0: g.x_of(chart_left, s), x1: g.x_of(chart_left, f) });
     }
 
-    // ---- Links (not in grouped views, where tasks leave their outline and may repeat) ----
-    let grouped = input.rows.iter().any(|&i| i >= super::GROUP_BASE);
-    if g.show_links && !grouped {
+    // ---- Links ----
+    if g.show_links && !multi && !input.rows.iter().any(|r| matches!(r, super::Row::Group(_))) {
         let link_stroke = Stroke::new(1.0, theme::pal().LINK);
-        for &idx in input.rows {
+        for idx in input.rows.iter().filter_map(super::Row::task) {
             let Some(t) = p.tasks.get(idx) else { continue };
             let Some(sg) = geom.get(&t.id).copied() else {
                 continue;
@@ -252,9 +359,9 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
     }
 
     // Milestone membership: dashed connectors from member tasks to their milestone.
-    if g.show_links && !grouped {
+    if g.show_links && !multi && !input.rows.iter().any(|r| matches!(r, super::Row::Group(_))) {
         let stroke = Stroke::new(1.0, theme::pal().MEMBER_LINK);
-        for &idx in input.rows {
+        for idx in input.rows.iter().filter_map(super::Row::task) {
             let Some(t) = p.tasks.get(idx) else { continue };
             if !t.is_milestone() || t.members.is_empty() {
                 continue;
@@ -275,23 +382,53 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
     // ---- Bars ----
     let label_font = FontId::proportional(11.5);
     let mut hovered: Option<(TaskId, &'static str)> = None;
+    // The part of a split task under the pointer (with the "part" and "part_end" zones).
+    let mut hovered_part: Option<usize> = None;
     let pointer = ui.input(|i| i.pointer.hover_pos());
     for r in first..last.min(input.rows.len()) {
-        let Some(&idx) = input.rows.get(r) else { continue };
+        let idx = match input.rows.get(r) {
+            Some(super::Row::Task(idx)) => *idx,
+            Some(super::Row::Group(group)) => {
+                // A group header spans its tasks, drawn like a summary bar on a tinted row.
+                let y = body.top() + r as f32 * rh - *scroll_y;
+                bp.rect_filled(Rect::from_min_size(pos2(body.left(), y), vec2(body.width(), rh)), 0.0, theme::pal().HEADER_BG);
+                let tasks = group.tasks.iter().filter_map(|&i| p.tasks.get(i));
+                let start = tasks.clone().filter_map(|t| t.sched.start).min();
+                let finish = tasks.filter_map(|t| t.sched.finish).max();
+                if let (Some(s), Some(f)) = (start, finish) {
+                    let (x0, x1) = (g.x_of(chart_left, s), g.x_of(chart_left, f).max(g.x_of(chart_left, s) + 1.0));
+                    let yc = y + rh / 2.0;
+                    bp.rect_filled(Rect::from_min_max(pos2(x0, yc - 3.0), pos2(x1, yc + 2.0)), 0.0, theme::pal().ACCENT_MID);
+                }
+                continue;
+            }
+            None => continue,
+        };
         let Some(t) = p.tasks.get(idx) else { continue };
         let Some(bg) = geom.get(&t.id).copied() else {
             continue;
         };
         let y = bg.y;
         let (x0, x1) = (bg.x0, bg.x1.max(bg.x0));
-        let critical = (g.show_critical || input.tracking) && t.sched.critical;
+        let critical = (g.show_critical || tracking) && t.sched.critical;
         let summary = t.sched.is_summary;
         let bar_rect = Rect::from_min_max(pos2(x0, y - BAR_H / 2.0), pos2(x1.max(x0 + 1.0), y + BAR_H / 2.0));
 
+        if multi {
+            // Only the baselines: no current bar to drag, but a click still selects the task.
+            if let Some(span) = baseline_stack(&bp, g, chart_left, t, y, rh, &multi_slots)
+                && let Some(pp) = pointer
+                && body.contains(pp)
+                && span.expand2(vec2(2.0, 3.0)).contains(pp)
+            {
+                hovered = Some((t.id, "select"));
+            }
+            continue;
+        }
+
         // Baseline (below the bar).
-        if (g.show_baseline || input.tracking)
-            && let Some(b) = t.baseline
-        {
+        let baseline = t.baseline_in(g.baseline_slot).filter(|_| g.show_baseline || tracking);
+        if let Some(b) = baseline {
             let bx0 = g.x_of(chart_left, b.start);
             let bx1 = g.x_of(chart_left, b.finish);
             if t.is_milestone() {
@@ -300,7 +437,7 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
                 bp.rect_filled(Rect::from_min_max(pos2(bx0, y + 3.0), pos2(bx1.max(bx0 + 1.0), y + 8.0)), 1.0, theme::pal().BAR_BASELINE);
             }
         }
-        let y_shift = if (g.show_baseline || input.tracking) && t.baseline.is_some() { -3.0 } else { 0.0 };
+        let y_shift = if baseline.is_some() { -3.0 } else { 0.0 };
         let bar_rect = bar_rect.translate(vec2(0.0, y_shift));
         let yc = y + y_shift;
 
@@ -346,8 +483,31 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
             } else {
                 (theme::pal().BAR_TASK, theme::pal().BAR_TASK_EDGE)
             };
-            bp.rect_filled(bar_rect, 2.0, fill);
-            bp.rect_stroke(bar_rect, 2.0, Stroke::new(1.0, edge), StrokeKind::Inside);
+            // A split task: its working parts joined by dots across the pauses.
+            let split = t.sched.parts.len() > 1;
+            if split {
+                let clip = bp.clip_rect();
+                let mut prev: Option<f32> = None;
+                for &(a, b) in &t.sched.parts {
+                    let (xa, xb) = (g.x_of(chart_left, a), g.x_of(chart_left, b));
+                    if let Some(px) = prev {
+                        // Dots only across the visible part, so a far-off resume date stays cheap.
+                        let (lo, hi) = ((px + 2.0).max(clip.left() - 5.0), (xa - 1.0).min(clip.right() + 5.0));
+                        let mut x = lo;
+                        while x < hi {
+                            bp.hline(x..=(x + 2.0).min(hi), yc, Stroke::new(1.0, edge));
+                            x += 5.0;
+                        }
+                    }
+                    let r = Rect::from_min_max(pos2(xa, bar_rect.top()), pos2(xb.max(xa + 1.0), bar_rect.bottom()));
+                    bp.rect_filled(r, 2.0, fill);
+                    bp.rect_stroke(r, 2.0, Stroke::new(1.0, edge), StrokeKind::Inside);
+                    prev = Some(xb);
+                }
+            } else {
+                bp.rect_filled(bar_rect, 2.0, fill);
+                bp.rect_stroke(bar_rect, 2.0, Stroke::new(1.0, edge), StrokeKind::Inside);
+            }
             if manual {
                 // Bracket ends mark manually scheduled tasks.
                 for (x, dir) in [(bar_rect.left(), 1.0), (bar_rect.right(), -1.0)] {
@@ -356,8 +516,19 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
                 }
             }
             if g.show_progress && t.sched.percent_complete > 0.0 {
-                let px = x0 + (x1 - x0) * t.sched.percent_complete / 100.0;
-                bp.rect_filled(Rect::from_min_max(pos2(x0, yc - 1.5), pos2(px, yc + 1.5)), 0.0, theme::pal().BAR_PROGRESS);
+                match (split, t.sched.stop) {
+                    // The work done fills the parts up to the stop.
+                    (true, Some(stop)) => {
+                        for &(a, b) in t.sched.parts.iter().filter(|(a, _)| *a < stop) {
+                            let (xa, xb) = (g.x_of(chart_left, a), g.x_of(chart_left, b.min(stop)));
+                            bp.rect_filled(Rect::from_min_max(pos2(xa, yc - 1.5), pos2(xb, yc + 1.5)), 0.0, theme::pal().BAR_PROGRESS);
+                        }
+                    }
+                    _ => {
+                        let px = x0 + (x1 - x0) * t.sched.percent_complete / 100.0;
+                        bp.rect_filled(Rect::from_min_max(pos2(x0, yc - 1.5), pos2(px, yc + 1.5)), 0.0, theme::pal().BAR_PROGRESS);
+                    }
+                }
             }
             // A task split by "Update Project": a gap with a dotted line until work resumes.
             if let Some((stop, resume)) = plancraft_core::extras::split_points(p, idx) {
@@ -396,7 +567,13 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
         if g.show_resource_names && !summary && !t.is_milestone() {
             let names = p.format_resource_names(t.id);
             if !names.is_empty() {
-                bp.text(pos2(x1 + 6.0, yc), Align2::LEFT_CENTER, names, label_font.clone(), theme::pal().TEXT);
+                bp.text(
+                    pos2(x1 + 6.0, yc),
+                    Align2::LEFT_CENTER,
+                    plancraft_core::bidi::display(&names),
+                    label_font.clone(),
+                    theme::pal().TEXT,
+                );
             }
         }
 
@@ -406,7 +583,53 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
         {
             let hit =
                 if t.is_milestone() { Rect::from_center_size(pos2(x0, yc), vec2(14.0, 14.0)) } else { bar_rect.expand2(vec2(2.0, 3.0)) };
-            if hit.contains(pp) {
+            // The parts of a task split as planned move on their own, unless work is under way
+            // (work done stays where it happened) or it also has pauses in work under way.
+            let planned = !summary && t.splits.is_empty() && t.actual_start.is_none() && t.sched.parts.len() > 1;
+            let part_at = |x: f32| {
+                // The part nearest the pointer, so tiny gaps at low zoom resolve sensibly.
+                t.sched
+                    .parts
+                    .iter()
+                    .map(|&(a, b)| (g.x_of(chart_left, a), g.x_of(chart_left, b)))
+                    .enumerate()
+                    .min_by(|(_, p), (_, q)| {
+                        let d = |(a, b): (f32, f32)| {
+                            if x < a {
+                                a - x
+                            } else if x > b {
+                                x - b
+                            } else {
+                                0.0
+                            }
+                        };
+                        d(*p).total_cmp(&d(*q))
+                    })
+                    .map(|(k, _)| k)
+            };
+            if hit.contains(pp) && g.split_mode {
+                if !summary && !t.is_milestone() {
+                    hovered = Some((t.id, "split"));
+                }
+            } else if hit.contains(pp)
+                && planned
+                && let Some(k) = part_at(pp.x)
+            {
+                let (a, b) = t.sched.parts.get(k).map_or((x0, x1), |&(a, b)| (g.x_of(chart_left, a), g.x_of(chart_left, b)));
+                let last = k + 1 == t.sched.parts.len();
+                // Only a part wide enough has a separate end to drag.
+                let at_end = b - a > 12.0 && pp.x >= b - 5.0;
+                hovered_part = Some(k);
+                hovered = Some((
+                    t.id,
+                    match (at_end, last, k) {
+                        (true, true, _) => "end",
+                        (true, false, _) => "part_end",
+                        (false, _, 0) => "bar",
+                        (false, _, _) => "part",
+                    },
+                ));
+            } else if hit.contains(pp) {
                 let zone = if summary || t.is_milestone() {
                     "bar"
                 } else if pp.x >= hit.right() - 5.0 {
@@ -430,24 +653,38 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
         bp.rect_filled(Rect::from_min_max(pos2(x0, body.top() + 2.0), pos2(x1, body.top() + 5.0)), 0.0, theme::pal().ACCENT_DARK);
     }
 
+    if multi {
+        baseline_legend(&bp, body, &multi_slots);
+    }
+
     // ---- Interaction ----
     match hovered {
-        Some((_, "end")) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
+        Some((_, "select")) => ui.ctx().set_cursor_icon(CursorIcon::PointingHand),
+        Some((_, "split")) => ui.ctx().set_cursor_icon(CursorIcon::Crosshair),
+        Some((_, "part")) => ui.ctx().set_cursor_icon(CursorIcon::Move),
+        Some((_, "end" | "part_end")) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
         Some((_, "progress")) => ui.ctx().set_cursor_icon(CursorIcon::ResizeEast),
         Some(_) => ui.ctx().set_cursor_icon(CursorIcon::Grab),
         None => {}
     }
     if resp.drag_started()
+        && !multi
+        && !g.split_mode
         && let Some((tid, zone)) = hovered
         && let Some(t) = p.task(tid)
     {
         let grab_x = resp.interact_pointer_pos().map(|pp| pp.x).unwrap_or(0.0);
         let start = t.sched.start.unwrap_or(p.start);
-        g.drag = Some(match zone {
-            "end" => BarDrag::Resize { task: tid },
-            "progress" => BarDrag::Progress { task: tid },
-            _ if t.sched.is_summary => BarDrag::Link { from: tid },
-            _ => BarDrag::Move { task: tid, grab_dx: grab_x - g.x_of(chart_left, start), origin_start: start },
+        let part = hovered_part.and_then(|k| t.sched.parts.get(k).map(|&(a, _)| (k, a)));
+        g.drag = Some(match (zone, part) {
+            ("part", Some((k, a))) => BarDrag::Part { task: tid, k, grab_dx: grab_x - g.x_of(chart_left, a), origin: a },
+            ("part_end", Some((k, _))) => BarDrag::PartEnd { task: tid, k },
+            _ => match zone {
+                "end" => BarDrag::Resize { task: tid },
+                "progress" => BarDrag::Progress { task: tid },
+                _ if t.sched.is_summary => BarDrag::Link { from: tid },
+                _ => BarDrag::Move { task: tid, grab_dx: grab_x - g.x_of(chart_left, start), origin_start: start },
+            },
         });
     }
     let snap = |t: NaiveDateTime| -> NaiveDateTime {
@@ -490,6 +727,40 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
                     }
                 }
             }
+            BarDrag::Part { task, k, grab_dx, origin } => {
+                let new_start = snap(g.time_at(chart_left, pp.x - grab_dx));
+                if let Some((a, b)) = p.task(task).and_then(|t| t.sched.parts.get(k).copied())
+                    && let Some(sg) = geom.get(&task)
+                {
+                    let x = g.x_of(chart_left, new_start);
+                    let w = (g.x_of(chart_left, b) - g.x_of(chart_left, a)).max(2.0);
+                    let ghost = Rect::from_min_max(pos2(x, sg.y - BAR_H / 2.0 - 1.0), pos2(x + w, sg.y + BAR_H / 2.0 + 1.0));
+                    bp.rect_stroke(ghost, 2.0, Stroke::new(1.5, theme::pal().ACCENT), StrokeKind::Outside);
+                }
+                tooltip_at(ui, pp, &format!("Part {}\nStart: {}", k + 1, format::date_long(Some(new_start))));
+                if resp.drag_stopped() {
+                    g.drag = None;
+                    if new_start != origin {
+                        actions.push(ChartAction::MovePart { task, k, start: new_start });
+                    }
+                }
+            }
+            BarDrag::PartEnd { task, k } => {
+                let new_finish = snap(g.time_at(chart_left, pp.x));
+                if let Some((a, _)) = p.task(task).and_then(|t| t.sched.parts.get(k).copied())
+                    && let Some(sg) = geom.get(&task)
+                {
+                    let x0 = g.x_of(chart_left, a);
+                    let x = g.x_of(chart_left, new_finish).max(x0 + 2.0);
+                    let ghost = Rect::from_min_max(pos2(x0, sg.y - BAR_H / 2.0 - 1.0), pos2(x, sg.y + BAR_H / 2.0 + 1.0));
+                    bp.rect_stroke(ghost, 2.0, Stroke::new(1.5, theme::pal().ACCENT), StrokeKind::Outside);
+                }
+                tooltip_at(ui, pp, &format!("Part {}\nFinish: {}", k + 1, format::date_long(Some(new_finish))));
+                if resp.drag_stopped() {
+                    g.drag = None;
+                    actions.push(ChartAction::SetPartFinish { task, k, finish: new_finish });
+                }
+            }
             BarDrag::Resize { task } => {
                 let name = p.task(task).map_or("", |t| t.name.as_str());
                 let new_finish = snap(g.time_at(chart_left, pp.x));
@@ -510,8 +781,15 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
             }
             BarDrag::Progress { task } => {
                 if let Some(sg) = geom.get(&task) {
-                    let pct = (((pp.x - sg.x0) / (sg.x1 - sg.x0).max(1.0)) * 100.0).clamp(0.0, 100.0).round() as u8;
-                    let px = sg.x0 + (sg.x1 - sg.x0) * pct as f32 / 100.0;
+                    let linear = (((pp.x - sg.x0) / (sg.x1 - sg.x0).max(1.0)) * 100.0).clamp(0.0, 100.0).round() as u8;
+                    // A split task does no work during its pauses: count only its working parts.
+                    let split_pct = p.task(task).filter(|t| t.sched.parts.len() > 1 && t.duration > 0).and_then(|t| {
+                        let cal = task_calendar(p, p.task_index(task)?);
+                        let done = plancraft_core::schedule::work_done_by(&t.sched.parts, &cal, g.time_at(chart_left, pp.x));
+                        u8::try_from((done.saturating_mul(100).saturating_add(t.duration / 2) / t.duration).clamp(0, 100)).ok()
+                    });
+                    let pct = split_pct.unwrap_or(linear);
+                    let px = if split_pct.is_some() { pp.x.clamp(sg.x0, sg.x1) } else { sg.x0 + (sg.x1 - sg.x0) * pct as f32 / 100.0 };
                     bp.rect_filled(Rect::from_min_max(pos2(sg.x0, sg.y - 2.0), pos2(px, sg.y + 2.0)), 0.0, theme::pal().GOLD);
                     tooltip_at(ui, pp, &crate::tr_dyn(&format!("{pct}% complete")));
                     if resp.drag_stopped() {
@@ -547,7 +825,23 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
         }
     } else if let Some((tid, _)) = hovered {
         // Tooltip with task details.
-        if let Some(t) = p.task(tid)
+        if multi
+            && let Some(t) = p.task(tid)
+            && let Some(pp) = pointer
+        {
+            // The bars here are baselines: list the ones shown, not the current schedule.
+            let mut text = t.name.clone();
+            for &n in &multi_slots {
+                let name = plancraft_core::baseline::PlanSlot::Baseline(n).name();
+                match t.baseline_in(n) {
+                    Some(b) => {
+                        text += &format!("\n{name}: {} – {}", format::date(Some(b.start)), format::date(Some(b.finish)));
+                    }
+                    None => text += &format!("\n{name}: NA"),
+                }
+            }
+            tooltip_at(ui, pp + vec2(12.0, 12.0), &text);
+        } else if let Some(t) = p.task(tid)
             && let Some(pp) = pointer
         {
             let mut text = crate::tr_dyn(&format!(
@@ -574,7 +868,13 @@ pub fn show(ui: &mut Ui, rect: Rect, g: &mut GanttState, scroll_y: &mut f32, inp
         }
     }
 
-    if resp.clicked() {
+    if resp.clicked() && g.split_mode {
+        // Split Task is one click: split the bar under the pointer, or do nothing elsewhere.
+        g.split_mode = false;
+        if let (Some((tid, "split")), Some(pp)) = (hovered, resp.interact_pointer_pos()) {
+            actions.push(ChartAction::Split { task: tid, at: g.time_at(chart_left, pp.x) });
+        }
+    } else if resp.clicked() {
         if let Some((tid, _)) = hovered {
             let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
             actions.push(ChartAction::Select { task: tid, shift, ctrl });

@@ -20,7 +20,7 @@ use chrono::NaiveDateTime;
 use crate::calendar::{CalLayer, WorkCal, shift};
 use crate::duration::{Lag, Minutes};
 use crate::guard::{self, Panicked};
-use crate::ids::{ResourceId, TaskId};
+use crate::ids::{CalendarId, ResourceId, TaskId};
 use crate::model::*;
 
 /// Where a link's predecessor dates come from.
@@ -48,6 +48,162 @@ struct Dates {
     ef: Option<NaiveDateTime>,
     ls: Option<NaiveDateTime>,
     lf: Option<NaiveDateTime>,
+    /// Completed and remaining parts of an in-progress task.
+    parts: Option<Parts>,
+}
+
+/// The completed and remaining parts of an in-progress task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Parts {
+    /// End of the completed part (Microsoft Project's Stop field).
+    pub stop: NaiveDateTime,
+    /// Start of the remaining part: the next working moment after `stop`, or the start of the next
+    /// working part when the task pauses at `stop` (Microsoft Project's Resume field).
+    pub resume: NaiveDateTime,
+    /// Working minutes left to do.
+    pub remaining: Minutes,
+    /// End of the last working part: the task's finish.
+    pub finish: NaiveDateTime,
+    /// Start of the last working part and the working minutes in it (the part that can still
+    /// slip); the actual start and the whole duration when the task is not split.
+    pub last: (NaiveDateTime, Minutes),
+    /// The task has pauses (see [`segments_of`]).
+    pub split: bool,
+}
+
+/// Most pauses one task can have; further ones are ignored.
+pub const MAX_SPLITS: usize = 100;
+
+/// The planned splits of a task that take effect: inside its work (`0 < work < dur`), with a
+/// length, one per work point (the first), in work order, and together at most
+/// [`MAX_MINUTES`](crate::limits::MAX_MINUTES) long (later ones are cut short).
+pub fn planned_gaps(gaps: &[Gap], dur: Minutes) -> Vec<Gap> {
+    let mut v: Vec<Gap> = gaps.iter().take(MAX_SPLITS).copied().filter(|g| g.work > 0 && g.work < dur && g.length > 0).collect();
+    v.sort_by_key(|g| g.work);
+    v.dedup_by_key(|g| g.work);
+    let mut left = crate::limits::MAX_MINUTES;
+    for g in &mut v {
+        g.length = g.length.min(left);
+        left -= g.length;
+    }
+    v.retain(|g| g.length > 0);
+    v
+}
+
+/// Working time a task spans from start to finish: its duration plus its planned splits.
+pub fn span_of(t: &Task, dur: Minutes) -> Minutes {
+    planned_gaps(&t.gaps, dur).iter().fold(dur, |s, g| s.saturating_add(g.length))
+}
+
+/// The working parts `(start, finish, work before it)` of a task laid out from `start`. After a
+/// planned split's work the task pauses for the split's length; after an in-progress split's work
+/// it stops until that split's resume date. Splits that would not leave a gap (or lie past the
+/// duration) are ignored, so a task with no real pause has one part.
+pub fn segments_of(
+    start: NaiveDateTime,
+    splits: &[Split],
+    gaps: &[Gap],
+    cal: &WorkCal,
+    dur: Minutes,
+) -> Vec<(NaiveDateTime, NaiveDateTime, Minutes)> {
+    enum Until {
+        Date(NaiveDateTime),
+        For(Minutes),
+    }
+    let mut breaks: Vec<(Minutes, Until)> = planned_gaps(gaps, dur).into_iter().map(|g| (g.work, Until::For(g.length))).collect();
+    breaks.extend(splits.iter().take(MAX_SPLITS).map(|s| (s.work, Until::Date(s.resume))));
+    breaks.sort_by_key(|b| b.0);
+    let mut out = Vec::new();
+    let (mut at, mut used) = (start, 0);
+    let mut k = 0;
+    while let Some(&(work, _)) = breaks.get(k) {
+        // Every pause at this work point: work goes on at the latest of them.
+        let same = breaks.iter().skip(k).take_while(|b| b.0 == work).count();
+        let group = breaks.get(k..k + same).unwrap_or_default();
+        k += same.max(1);
+        if work <= used {
+            continue;
+        }
+        if work >= dur {
+            break;
+        }
+        let end = cal.add(at, work - used);
+        let resume = group
+            .iter()
+            .map(|(_, until)| match until {
+                Until::Date(d) => cal.snap_forward(*d),
+                Until::For(len) => cal.snap_forward(cal.add(cal.snap_forward(end), *len)),
+            })
+            .max()
+            .unwrap_or(end);
+        if resume <= cal.snap_forward(end) {
+            // No gap: the part simply goes on.
+            continue;
+        }
+        out.push((at, end, used));
+        at = resume;
+        used = work;
+    }
+    out.push((at, cal.add(at, dur.saturating_sub(used)), used));
+    out
+}
+
+/// Splits an in-progress task (actual start, 1-99% complete, no actual finish) into the part done
+/// and the part left; `None` for any other task.
+pub fn parts_of(t: &Task, cal: &WorkCal, dur: Minutes) -> Option<Parts> {
+    let start = t.actual_start?;
+    if t.actual_finish.is_some() || t.is_milestone() || dur <= 0 || t.mode == ScheduleMode::Manual {
+        return None;
+    }
+    let pct = Minutes::from(t.percent_complete);
+    if !(1..100).contains(&pct) {
+        return None;
+    }
+    let done = dur.saturating_mul(pct) / 100;
+    let remaining = dur.saturating_sub(done);
+    if t.splits.is_empty() && planned_gaps(&t.gaps, dur).is_empty() {
+        let stop = cal.add(start, done);
+        return Some(Parts {
+            stop,
+            resume: cal.snap_forward(stop),
+            remaining,
+            finish: cal.add(start, dur),
+            last: (start, dur),
+            split: false,
+        });
+    }
+    let segs = segments_of(start, &t.splits, &t.gaps, cal, dur);
+    let (stop, resume) = stop_and_resume(&segs, cal, done)?;
+    let &(last_start, finish, before) = segs.last()?;
+    Some(Parts { stop, resume, remaining, finish, last: (last_start, dur.saturating_sub(before)), split: segs.len() > 1 })
+}
+
+/// Where `done` working minutes end within `segs` (the Stop), and where the rest starts (the
+/// Resume: the next part when the work done ends exactly at a pause).
+fn stop_and_resume(
+    segs: &[(NaiveDateTime, NaiveDateTime, Minutes)],
+    cal: &WorkCal,
+    done: Minutes,
+) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    for (k, &(s, f, before)) in segs.iter().enumerate() {
+        let next = segs.get(k + 1);
+        let len = next.map_or(Minutes::MAX, |n| n.2.saturating_sub(before));
+        if done.saturating_sub(before) < len {
+            let stop = cal.add(s, done.saturating_sub(before).max(0));
+            return Some((stop, cal.snap_forward(stop)));
+        }
+        if let Some(&(ns, _, nb)) = next
+            && done == nb
+        {
+            return Some((f, ns));
+        }
+    }
+    segs.last().map(|&(_, f, _)| (f, f))
+}
+
+/// Working minutes of `segs` done by `upto`.
+pub fn work_done_by(segs: &[(NaiveDateTime, NaiveDateTime)], cal: &WorkCal, upto: NaiveDateTime) -> Minutes {
+    segs.iter().filter(|(s, _)| *s < upto).map(|&(s, f)| cal.between(s, f.min(upto)).max(0)).fold(0, Minutes::saturating_add)
 }
 
 /// Summary of a recalculation.
@@ -88,9 +244,29 @@ fn calendar_for<'a>(p: &'a Project, task: &Task, resources: &[&'a Resource]) -> 
         return WorkCal::single(base);
     }
     let wc = WorkCal::from_layers(layers);
-    // Fall back to the task/project calendar when resources share no working time at all.
-    let any = p.start.date().iter_days().take(28).any(|d| wc.is_working_day(d));
+    // Fall back to the task/project calendar only when the resources share no working time at
+    // all. Search well past a long absence (a month of leave at the project start must delay
+    // the task, not drop the resource's calendar); the search stops at the first working day.
+    let any = p.start.date().iter_days().take(RESOURCE_CALENDAR_SEARCH_DAYS).any(|d| wc.is_working_day(d));
     if any { wc } else { WorkCal::single(base) }
+}
+
+/// How far ahead [`calendar_for`] looks for working time shared by a task's resources.
+const RESOURCE_CALENDAR_SEARCH_DAYS: usize = 3 * 366;
+
+/// What makes two tasks' scheduling calendars identical (see [`calendar_for`]): the task
+/// calendar and, when resource calendars apply, the assigned work resources.
+type CalKey = (Option<CalendarId>, Vec<ResourceId>);
+
+fn cal_key(p: &Project, task: &Task, resources: &[&Resource]) -> CalKey {
+    let mut ids: Vec<ResourceId> = if p.settings.use_resource_calendars && !task.ignore_resource_calendars {
+        resources.iter().filter(|r| r.kind == ResourceType::Work).map(|r| r.id).collect()
+    } else {
+        Vec::new()
+    };
+    ids.sort();
+    ids.dedup();
+    (task.calendar, ids)
 }
 
 /// The project calendar used for lags and summary durations.
@@ -146,7 +322,11 @@ fn parents(p: &Project) -> Vec<Option<usize>> {
 struct Engine<'a> {
     p: &'a Project,
     proj_cal: WorkCal<'a>,
+    /// Distinct scheduling calendars; tasks with the same calendar and resources share one, so
+    /// its cached spans serve all of them.
     cals: Vec<WorkCal<'a>>,
+    /// Index into `cals` for each task.
+    cal_of: Vec<usize>,
     leaves: Vec<usize>,
     is_leaf: Vec<bool>,
     parent: Vec<Option<usize>>,
@@ -159,6 +339,44 @@ struct Engine<'a> {
     order: Vec<usize>,
     warnings: Vec<String>,
     dates: Vec<Dates>,
+    /// Working parts of split tasks (by task index).
+    segments: HashMap<usize, Vec<(NaiveDateTime, NaiveDateTime)>>,
+    /// Per task: the latest Start No Earlier Than date and the earliest deadline set on its
+    /// ancestor summaries (both apply to every subtask).
+    inherited: Vec<Inherited>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Inherited {
+    snet: Option<NaiveDateTime>,
+    deadline: Option<NaiveDateTime>,
+}
+
+/// Constraints a summary passes to its subtasks: its Start No Earlier Than date drives their
+/// starts, and its deadline bounds their late finish (and so their slack).
+fn inherited_from_summaries(p: &Project, parent: &[Option<usize>]) -> Vec<Inherited> {
+    let mut out = vec![Inherited::default(); p.tasks.len()];
+    // Parents come before their children, so each parent's value is final when a child reads it.
+    for i in 0..p.tasks.len() {
+        let Some(pi) = parent.get(i).copied().flatten() else { continue };
+        let (Some(par), Some(up)) = (p.tasks.get(pi), out.get(pi).copied()) else { continue };
+        // An inactive summary passes on what its own summaries set, not its own date or deadline.
+        let own_snet = par.constraint.date.filter(|_| par.active && par.constraint.kind == ConstraintKind::Snet);
+        let own_deadline = par.deadline.filter(|_| par.active);
+        let v = Inherited { snet: up.snet.max(own_snet), deadline: min_opt(up.deadline, own_deadline) };
+        if let Some(slot) = out.get_mut(i) {
+            *slot = v;
+        }
+    }
+    out
+}
+
+fn min_opt(a: Option<NaiveDateTime>, b: Option<NaiveDateTime>) -> Option<NaiveDateTime> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
 }
 
 impl<'a> Engine<'a> {
@@ -173,14 +391,29 @@ impl<'a> Engine<'a> {
                 assigned.entry(a.task).or_default().push(r);
             }
         }
-        let cals = p.tasks.iter().map(|t| calendar_for(p, t, assigned.get(&t.id).map(Vec::as_slice).unwrap_or_default())).collect();
+        let mut cals: Vec<WorkCal<'a>> = Vec::new();
+        let mut cal_keys: HashMap<CalKey, usize> = HashMap::new();
+        let cal_of = p
+            .tasks
+            .iter()
+            .map(|t| {
+                let resources = assigned.get(&t.id).map(Vec::as_slice).unwrap_or_default();
+                *cal_keys.entry(cal_key(p, t, resources)).or_insert_with(|| {
+                    cals.push(calendar_for(p, t, resources));
+                    cals.len().saturating_sub(1)
+                })
+            })
+            .collect();
+        let parent = parents(p);
+        let inherited = inherited_from_summaries(p, &parent);
         Self {
             p,
             proj_cal: project_calendar(p),
             cals,
+            cal_of,
             leaves,
             is_leaf,
-            parent: parents(p),
+            parent,
             position: p.tasks.iter().enumerate().map(|(i, t)| (t.id, i)).collect(),
             edges: Vec::new(),
             incoming: vec![Vec::new(); n],
@@ -188,7 +421,45 @@ impl<'a> Engine<'a> {
             order: Vec::new(),
             warnings: Vec::new(),
             dates: vec![Dates::default(); n],
+            segments: HashMap::new(),
+            inherited,
         }
+    }
+
+    fn inherited(&self, i: usize) -> Inherited {
+        self.inherited.get(i).copied().unwrap_or_default()
+    }
+
+    /// Whether a backward-pass or slack calculation should follow `edge` from leaf `i`.
+    ///
+    /// An inactive successor does not affect how other tasks are scheduled. A link from a
+    /// summary's start constrains only the subtask that sets that start (the earliest), not
+    /// every subtask, or all of them would get the same late start and negative slack.
+    /// `group_start[e]` is the earliest start of a summary-start edge's group (see
+    /// [`Engine::summary_group_starts`]).
+    fn edge_constrains(&self, e: usize, edge: &Edge, i: usize, group_start: &[Option<NaiveDateTime>]) -> bool {
+        if self.task(edge.succ).is_none_or(|t| !t.active) {
+            return false;
+        }
+        match &edge.pred {
+            PredSource::SummaryStart(_) => {
+                let earliest = group_start.get(e).copied().flatten();
+                earliest.is_some() && self.date(i).es == earliest
+            }
+            _ => true,
+        }
+    }
+
+    /// The earliest start within each summary-start edge's group (early dates are final once the
+    /// forward pass is done), so each edge's group is scanned once per pass, not once per leaf.
+    fn summary_group_starts(&self) -> Vec<Option<NaiveDateTime>> {
+        self.edges
+            .iter()
+            .map(|edge| match &edge.pred {
+                PredSource::SummaryStart(group) => group.iter().filter_map(|&g| self.date(g).es).min(),
+                _ => None,
+            })
+            .collect()
     }
 
     fn task(&self, i: usize) -> Option<&'a Task> {
@@ -200,7 +471,7 @@ impl<'a> Engine<'a> {
     }
 
     fn cal(&self, i: usize) -> &WorkCal<'a> {
-        self.cals.get(i).unwrap_or(&self.proj_cal)
+        self.cal_of.get(i).and_then(|&c| self.cals.get(c)).unwrap_or(&self.proj_cal)
     }
 
     fn date(&self, i: usize) -> Dates {
@@ -211,6 +482,12 @@ impl<'a> Engine<'a> {
         if let Some(d) = self.dates.get_mut(i) {
             d.es = Some(es);
             d.ef = Some(ef);
+        }
+    }
+
+    fn set_parts(&mut self, i: usize, parts: Option<Parts>) {
+        if let Some(d) = self.dates.get_mut(i) {
+            d.parts = parts;
         }
     }
 
@@ -229,11 +506,12 @@ impl<'a> Engine<'a> {
         self.outgoing.get(i).map(Vec::as_slice).unwrap_or_default()
     }
 
+    /// The leaf itself, or a summary's active leaf subtasks (inactive ones drive nothing).
     fn leaf_descendants(&self, idx: usize) -> Vec<usize> {
         if self.leaf(idx) {
             return vec![idx];
         }
-        self.p.descendants_range(idx).filter(|&i| self.leaf(i)).collect()
+        self.p.descendants_range(idx).filter(|&i| self.leaf(i) && self.task(i).is_some_and(|t| t.active)).collect()
     }
 
     fn resolve_pred(&mut self, r: &TaskRef, kind: LinkType, succ_name: &str) -> Vec<PredSource> {
@@ -400,11 +678,13 @@ impl<'a> Engine<'a> {
             let Some(t) = self.task(i) else { continue };
             let cal = self.cal(i);
             let dur = self.duration_of(i);
+            // Working time from start to finish: the duration plus any planned splits.
+            let span = if t.mode == ScheduleMode::Auto { span_of(t, dur) } else { dur };
 
             let place = |start: NaiveDateTime| -> (NaiveDateTime, NaiveDateTime) {
                 if dur > 0 {
                     let s = cal.snap_forward(start);
-                    (s, cal.add(s, dur))
+                    (s, cal.add(s, span))
                 } else {
                     let s = cal.snap_event(start);
                     (s, s)
@@ -428,8 +708,8 @@ impl<'a> Engine<'a> {
                 let cand_start = match edge.kind {
                     LinkType::FS => apply_lag(&self.proj_cal, pf, edge.lag, pdur),
                     LinkType::SS => apply_lag(&self.proj_cal, ps, edge.lag, pdur),
-                    LinkType::FF => cal.sub(apply_lag(&self.proj_cal, pf, edge.lag, pdur), dur),
-                    LinkType::SF => cal.sub(apply_lag(&self.proj_cal, ps, edge.lag, pdur), dur),
+                    LinkType::FF => cal.sub(apply_lag(&self.proj_cal, pf, edge.lag, pdur), span),
+                    LinkType::SF => cal.sub(apply_lag(&self.proj_cal, ps, edge.lag, pdur), span),
                 };
                 if cand_start > es {
                     es = cand_start;
@@ -437,12 +717,17 @@ impl<'a> Engine<'a> {
                 }
             }
 
+            // A Start No Earlier Than date on a summary drives its subtasks' starts.
+            if let Some(snet) = self.inherited(i).snet {
+                es = es.max(snet);
+            }
+
             let mut warnings = Vec::new();
             if let Some(date) = t.constraint.date.filter(|_| t.constraint.kind.needs_date()) {
                 let finish_of = |s: NaiveDateTime| place(s).1;
                 match t.constraint.kind {
                     ConstraintKind::Snet => es = es.max(date),
-                    ConstraintKind::Fnet => es = es.max(cal.sub(date, dur)),
+                    ConstraintKind::Fnet => es = es.max(cal.sub(date, span)),
                     ConstraintKind::Mso => {
                         if warn && driven_by_link && place(es).0 > place(date).0 {
                             warnings.push(format!("'{}': links require a later start than its Must Start On date", t.name));
@@ -450,7 +735,7 @@ impl<'a> Engine<'a> {
                         es = date;
                     }
                     ConstraintKind::Mfo => {
-                        let s = if dur > 0 { cal.sub(date, dur) } else { date };
+                        let s = if dur > 0 { cal.sub(date, span) } else { date };
                         if warn && driven_by_link && place(es).0 > place(s).0 {
                             warnings.push(format!("'{}': links require a later finish than its Must Finish On date", t.name));
                         }
@@ -469,7 +754,7 @@ impl<'a> Engine<'a> {
                             if warn {
                                 warnings.push(format!("'{}' cannot finish by its Finish No Later Than date", t.name));
                             }
-                            es = if dur > 0 { cal.sub(date, dur) } else { date };
+                            es = if dur > 0 { cal.sub(date, span) } else { date };
                         }
                     }
                     ConstraintKind::Asap | ConstraintKind::Alap => {}
@@ -485,28 +770,51 @@ impl<'a> Engine<'a> {
             }
 
             let (mut s, mut f) = place(es);
+            let parts = parts_of(t, cal, dur);
             if let Some(a) = t.actual_start {
                 s = a;
-                f = if dur > 0 { cal.add(a, dur) } else { a };
-                // Split by "Update Project": the unfinished part resumes later.
-                if let Some(r) = t.resume
+                f = match parts {
+                    Some(pt) => pt.finish,
+                    None if dur > 0 => cal.add(a, span),
+                    None => a,
+                };
+                if t.splits.is_empty()
+                    && t.gaps.is_empty()
+                    && let Some(r) = t.resume
                     && dur > 0
                     && t.percent_complete < 100
                 {
-                    let done = dur * Minutes::from(t.percent_complete) / 100;
+                    let done = dur.saturating_mul(Minutes::from(t.percent_complete)) / 100;
                     let stop = cal.add(a, done);
                     if r > stop {
-                        f = cal.add(cal.snap_forward(r), dur - done);
+                        f = cal.add(cal.snap_forward(r), dur.saturating_sub(done));
                     }
                 }
             }
             if let Some(af) = t.actual_finish {
                 if t.actual_start.is_none() {
-                    s = if dur > 0 { cal.sub(af, dur) } else { af };
+                    s = if dur > 0 { cal.sub(af, span) } else { af };
                 }
                 f = af.max(s);
             }
+            let segments: Vec<(NaiveDateTime, NaiveDateTime)> = match (parts, t.actual_start, t.actual_finish) {
+                (Some(pt), Some(a), _) if pt.split => {
+                    segments_of(a, &t.splits, &t.gaps, cal, dur).into_iter().map(|(s, f, _)| (s, f)).collect()
+                }
+                // Planned splits in a task not under way (or finished as planned): its parts from its start.
+                (None, _, None) if span > dur => {
+                    let segs = segments_of(s, &[], &t.gaps, cal, dur);
+                    if segs.len() > 1 { segs.into_iter().map(|(s, f, _)| (s, f)).collect() } else { Vec::new() }
+                }
+                _ => Vec::new(),
+            };
             self.warnings.extend(warnings);
+            self.set_parts(i, parts);
+            if segments.is_empty() {
+                self.segments.remove(&i);
+            } else {
+                self.segments.insert(i, segments);
+            }
             self.set_early(i, s, f);
         }
     }
@@ -522,10 +830,12 @@ impl<'a> Engine<'a> {
         let p = self.p;
         let (_, finish) = self.project_bounds();
         let project_finish = finish.unwrap_or(p.start);
+        let group_start = self.summary_group_starts();
         for i in self.order.clone().into_iter().rev() {
             let Some(t) = self.task(i) else { continue };
             let cal = self.cal(i);
             let dur = self.duration_of(i);
+            let span = if t.mode == ScheduleMode::Auto { span_of(t, dur) } else { dur };
             let (Some(es), Some(ef)) = (self.date(i).es, self.date(i).ef) else {
                 continue;
             };
@@ -536,32 +846,42 @@ impl<'a> Engine<'a> {
             }
 
             let mut lf = project_finish.max(ef);
-            if let Some(d) = t.deadline {
+            // Deadlines (the task's own and its summaries') limit the late finish, so they
+            // reduce total slack; they don't move the task.
+            if let Some(d) = min_opt(t.deadline, self.inherited(i).deadline) {
                 lf = lf.min(d);
             }
             for &e in self.outgoing(i) {
                 let Some(edge) = self.edges.get(e) else { continue };
+                if !self.edge_constrains(e, edge, i, &group_start) {
+                    continue;
+                }
                 let (Some(sls), Some(slf)) = (self.date(edge.succ).ls, self.date(edge.succ).lf) else {
                     continue;
                 };
                 let cand_lf = match edge.kind {
                     LinkType::FS => unapply_lag(&self.proj_cal, sls, edge.lag, dur),
                     LinkType::FF => unapply_lag(&self.proj_cal, slf, edge.lag, dur),
-                    LinkType::SS => cal.add(unapply_lag(&self.proj_cal, sls, edge.lag, dur), dur),
-                    LinkType::SF => cal.add(unapply_lag(&self.proj_cal, slf, edge.lag, dur), dur),
+                    LinkType::SS => cal.add(unapply_lag(&self.proj_cal, sls, edge.lag, dur), span),
+                    LinkType::SF => cal.add(unapply_lag(&self.proj_cal, slf, edge.lag, dur), span),
                 };
                 lf = lf.min(cand_lf);
             }
             if let Some(date) = t.constraint.date.filter(|_| t.constraint.kind.needs_date()) {
                 match t.constraint.kind {
-                    ConstraintKind::Snlt => lf = lf.min(if dur > 0 { cal.add(date, dur) } else { date }),
+                    ConstraintKind::Snlt => lf = lf.min(if dur > 0 { cal.add(date, span) } else { date }),
                     ConstraintKind::Fnlt => lf = lf.min(date),
                     ConstraintKind::Mso | ConstraintKind::Mfo => lf = ef,
                     _ => {}
                 }
             }
             let lf = cal.snap_backward(lf);
-            let ls = if dur > 0 { cal.sub(lf, dur) } else { lf };
+            // A split task's last part is what can still move: its Late Start is that part's.
+            let ls = match self.date(i).parts {
+                Some(pt) if pt.split => cal.sub(lf, pt.last.1),
+                _ if dur > 0 => cal.sub(lf, span),
+                _ => lf,
+            };
             self.set_late(i, ls, lf);
         }
     }
@@ -571,17 +891,25 @@ impl<'a> Engine<'a> {
         let n = self.p.tasks.len();
         let mut total_slack = vec![0; n];
         let mut free_slack = vec![0; n];
+        let group_start = self.summary_group_starts();
         for &i in &self.order {
             let d = self.date(i);
             let cal = self.cal(i);
             let (Some(es), Some(ef), Some(ls), Some(lf)) = (d.es, d.ef, d.ls, d.lf) else {
                 continue;
             };
-            let ts = cal.between(es, ls).min(cal.between(ef, lf));
+            let ts = match d.parts {
+                // The start of a split task is fixed; only its remaining part can slip.
+                Some(pt) if pt.split => cal.between(ef, lf),
+                _ => cal.between(es, ls).min(cal.between(ef, lf)),
+            };
             let dur = self.duration_of(i);
             let mut fs = Minutes::MAX;
             for &e in self.outgoing(i) {
                 let Some(edge) = self.edges.get(e) else { continue };
+                if !self.edge_constrains(e, edge, i, &group_start) {
+                    continue;
+                }
                 let sd = self.date(edge.succ);
                 let (Some(ses), Some(sef)) = (sd.es, sd.ef) else {
                     continue;
@@ -635,7 +963,11 @@ fn rollup_tracking(p: &mut Project) {
     for t in &mut p.tasks {
         let (mut work, assigned_actual, assigned_cost, has_work_assignment) = by_task.get(&t.id).copied().unwrap_or_default();
         let actual = entry_by_task.get(&t.id).copied().unwrap_or(0).saturating_add(assigned_actual);
-        if !has_work_assignment && let Some(est) = &t.estimate {
+        // A summary's work is its subtasks' (plus any assignments of its own), never an estimate.
+        if !has_work_assignment
+            && !t.sched.is_summary
+            && let Some(est) = &t.estimate
+        {
             work = est.expected_work(&settings);
         }
         t.sched.work = work;
@@ -685,6 +1017,17 @@ pub fn try_recalculate(p: &mut Project) -> Result<ScheduleReport, Panicked> {
 fn calculate(p: &mut Project) -> ScheduleReport {
     for t in &mut p.tasks {
         t.outline_level = t.outline_level.max(1);
+        // Older edition files stored one pause as `resume`. Convert it once so the new
+        // Stop/Resume fields, work distribution, split bars and PDF all see the same parts.
+        if let Some(resume) = t.resume.take()
+            && t.actual_start.is_some()
+            && (1..100).contains(&t.percent_complete)
+        {
+            let work = t.actual_duration();
+            t.splits.retain(|split| split.work < work);
+            t.splits.truncate(MAX_SPLITS.saturating_sub(1));
+            t.splits.push(crate::model::Split { work, resume });
+        }
     }
     let summary: Vec<bool> = (0..p.tasks.len()).map(|i| p.has_children(i)).collect();
     for (t, s) in p.tasks.iter_mut().zip(&summary) {
@@ -692,7 +1035,7 @@ fn calculate(p: &mut Project) -> ScheduleReport {
     }
     rollup_tracking(p);
 
-    let (dates, order_warn, total_slack, free_slack) = {
+    let (dates, order_warn, total_slack, free_slack, mut segments) = {
         let mut eng = Engine::new(p);
         eng.build_edges();
         eng.topo_sort();
@@ -713,7 +1056,7 @@ fn calculate(p: &mut Project) -> ScheduleReport {
         eng.forward(&pins, true);
         eng.backward();
         let (total_slack, free_slack) = eng.slack();
-        (eng.dates, eng.warnings, total_slack, free_slack)
+        (eng.dates, eng.warnings, total_slack, free_slack, eng.segments)
     };
 
     let mut report = ScheduleReport { warnings: order_warn, ..Default::default() };
@@ -732,6 +1075,9 @@ fn calculate(p: &mut Project) -> ScheduleReport {
         t.sched.early_finish = d.ef;
         t.sched.late_start = d.ls;
         t.sched.late_finish = d.lf;
+        t.sched.stop = d.parts.map(|pt| pt.stop);
+        t.sched.resume = d.parts.map(|pt| pt.resume);
+        t.sched.parts = segments.remove(&i).unwrap_or_default();
         t.sched.total_slack = ts;
         t.sched.free_slack = free_slack.get(i).copied().unwrap_or(0);
         t.sched.duration = if t.is_milestone() { 0 } else { t.duration };
@@ -744,17 +1090,19 @@ fn calculate(p: &mut Project) -> ScheduleReport {
         t.sched.warnings = warnings;
     }
 
-    rollup_summaries(p);
+    // Summaries' own fixed costs and assignments (active summaries only), counted once at the
+    // project level on top of the leaves.
+    let own = rollup_summaries(p);
 
     // Project-level rollup.
     let leaves: Vec<&Task> = p.tasks.iter().filter(|t| !t.sched.is_summary && t.active).collect();
     let start = leaves.iter().filter_map(|t| t.sched.start).min();
     let finish = leaves.iter().filter_map(|t| t.sched.finish).max();
-    let work = leaves.iter().fold(0, |acc: Minutes, t| acc.saturating_add(t.sched.work));
-    let actual = leaves.iter().fold(0, |acc: Minutes, t| acc.saturating_add(t.sched.actual_work));
-    let cost: f64 = leaves.iter().map(|t| t.sched.cost).sum();
+    let work = leaves.iter().fold(own.work, |acc: Minutes, t| acc.saturating_add(t.sched.work));
+    let actual = leaves.iter().fold(own.actual, |acc: Minutes, t| acc.saturating_add(t.sched.actual_work));
+    let cost: f64 = own.cost + leaves.iter().map(|t| t.sched.cost).sum::<f64>();
     let (num, den) = leaves.iter().fold((0.0f64, 0.0f64), |(n, d), t| {
-        let w = t.duration.max(1) as f64;
+        let w = percent_weight(t);
         (n + w * f64::from(t.sched.percent_complete), d + w)
     });
     let pct = if den > 0.0 { (num / den) as f32 } else { 0.0 };
@@ -804,18 +1152,37 @@ struct Rollup {
     free: Minutes,
     critical: bool,
     percent: f32,
+    /// (weighted progress, weight) over all subtasks below, for the parent's rollup.
+    weight: (f64, f64),
 }
 
-fn rollup_of(p: &Project, children: &[usize], own_fixed_cost: f64) -> Rollup {
-    let kids: Vec<&Task> = children.iter().filter_map(|&c| p.tasks.get(c)).collect();
-    let active: Vec<&Task> = kids.iter().copied().filter(|t| t.active).collect();
-    let src = if active.is_empty() { &kids } else { &active };
+/// Weight of a subtask in % complete rollups: its duration (a milestone counts as one minute),
+/// so a summary's % complete is the duration-weighted progress of all subtasks below it.
+fn percent_weight(t: &Task) -> f64 {
+    if t.is_milestone() { 1.0 } else { t.duration.max(1) as f64 }
+}
+
+/// Work, actual work and cost a summary carries itself (fixed cost and its own assignments).
+#[derive(Clone, Copy, Default)]
+struct Own {
+    work: Minutes,
+    actual: Minutes,
+    cost: f64,
+}
+
+/// `weights[c]` is the (weighted progress, weight) of task `c`: its own for a subtask, the sum
+/// over its subtasks for a summary (so nested summaries weigh by subtask durations, not span).
+fn rollup_of(p: &Project, children: &[usize], own: Own, weights: &[(f64, f64)]) -> Rollup {
+    let kids: Vec<(usize, &Task)> = children.iter().filter_map(|&c| p.tasks.get(c).map(|t| (c, t))).collect();
+    let active: Vec<(usize, &Task)> = kids.iter().copied().filter(|(_, t)| t.active).collect();
+    let pairs = if active.is_empty() { &kids } else { &active };
+    let src: Vec<&Task> = pairs.iter().map(|(_, t)| *t).collect();
+    let (num, den) = pairs.iter().fold((0.0f64, 0.0f64), |(nn, d), (c, _)| {
+        let (wn, wd) = weights.get(*c).copied().unwrap_or_default();
+        (nn + wn, d + wd)
+    });
     let start = src.iter().filter_map(|t| t.sched.start).min();
     let finish = src.iter().filter_map(|t| t.sched.finish).max();
-    let (num, den) = src.iter().fold((0.0f64, 0.0f64), |(nn, d), t| {
-        let w = t.sched.duration.max(1) as f64;
-        (nn + w * f64::from(t.sched.percent_complete), d + w)
-    });
     Rollup {
         start,
         finish,
@@ -823,18 +1190,28 @@ fn rollup_of(p: &Project, children: &[usize], own_fixed_cost: f64) -> Rollup {
         ef: src.iter().filter_map(|t| t.sched.early_finish).max(),
         ls: src.iter().filter_map(|t| t.sched.late_start).min(),
         lf: src.iter().filter_map(|t| t.sched.late_finish).max(),
-        work: src.iter().fold(0, |acc: Minutes, t| acc.saturating_add(t.sched.work)),
-        actual: src.iter().fold(0, |acc: Minutes, t| acc.saturating_add(t.sched.actual_work)),
-        cost: src.iter().map(|t| t.sched.cost).sum::<f64>() + own_fixed_cost,
+        work: src.iter().fold(own.work, |acc: Minutes, t| acc.saturating_add(t.sched.work)),
+        actual: src.iter().fold(own.actual, |acc: Minutes, t| acc.saturating_add(t.sched.actual_work)),
+        cost: src.iter().map(|t| t.sched.cost).sum::<f64>() + own.cost,
         slack: src.iter().map(|t| t.sched.total_slack).min().unwrap_or(0),
         free: src.iter().map(|t| t.sched.free_slack).min().unwrap_or(0),
         critical: src.iter().any(|t| t.sched.critical),
         percent: if den > 0.0 { (num / den) as f32 } else { 0.0 },
+        weight: (num, den),
     }
 }
 
-fn rollup_summaries(p: &mut Project) {
+/// Rolls subtasks up into their summaries. Returns the summaries' own work and cost (fixed costs
+/// and assignments on summary rows), totalled over active summaries for the project level.
+fn rollup_summaries(p: &mut Project) -> Own {
     let parent = parents(p);
+    let mut total_own = Own::default();
+    // Leaves weigh themselves; summaries get the sum of their children below.
+    let mut weights: Vec<(f64, f64)> = p
+        .tasks
+        .iter()
+        .map(|t| if t.sched.is_summary { (0.0, 0.0) } else { (percent_weight(t) * f64::from(t.sched.percent_complete), percent_weight(t)) })
+        .collect();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); p.tasks.len()];
     for (c, par) in parent.iter().enumerate() {
         if let Some(list) = par.and_then(|pi| children.get_mut(pi)) {
@@ -850,7 +1227,19 @@ fn rollup_summaries(p: &mut Project) {
             continue;
         }
         let kids = children.get(i).map(Vec::as_slice).unwrap_or_default();
-        let r = rollup_of(p, kids, t.fixed_cost);
+        // Before the rollup overwrites them, `sched.work/actual_work/cost` hold the summary's own
+        // values (rollup_tracking: its assignments and fixed cost). Indenting a task under one
+        // with assignments must not lose that work.
+        let own = Own { work: t.sched.work, actual: t.sched.actual_work, cost: t.sched.cost };
+        if t.active {
+            total_own.work = total_own.work.saturating_add(own.work);
+            total_own.actual = total_own.actual.saturating_add(own.actual);
+            total_own.cost += own.cost;
+        }
+        let r = rollup_of(p, kids, own, &weights);
+        if let Some(w) = weights.get_mut(i) {
+            *w = r.weight;
+        }
         let duration = match (r.start, r.finish) {
             (Some(s), Some(f)) => pc.between(s, f),
             _ => 0,
@@ -870,6 +1259,15 @@ fn rollup_summaries(p: &mut Project) {
         t.sched.critical = r.critical;
         t.sched.duration = duration;
         t.sched.percent_complete = r.percent;
+        t.sched.stop = None;
+        t.sched.resume = None;
+        t.sched.parts.clear();
         t.sched.warnings.clear();
+        if let (Some(dl), Some(f)) = (t.deadline, r.finish)
+            && f > dl
+        {
+            t.sched.warnings.push(format!("Finishes after its deadline ({})", dl.format("%Y-%m-%d")));
+        }
     }
+    total_own
 }

@@ -11,8 +11,6 @@
 //! without re-running the engine, but they are always overwritten on
 //! recalculation.
 
-use std::collections::BTreeMap;
-
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -279,6 +277,22 @@ impl Estimate {
     }
 }
 
+/// A pause in a task: after `work` working minutes of the task, work stops until `resume`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Split {
+    pub work: Minutes,
+    pub resume: NaiveDateTime,
+}
+
+/// A split planned in a task: after `work` working minutes of the task, work pauses for `length`
+/// working minutes. Unlike a [`Split`] (a pause in work already under way, until a fixed date),
+/// it moves with the task.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Gap {
+    pub work: Minutes,
+    pub length: Minutes,
+}
+
 /// A snapshot of planned values used to measure variance.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Baseline {
@@ -288,6 +302,13 @@ pub struct Baseline {
     pub work: Minutes,
     pub cost: f64,
     pub saved: NaiveDateTime,
+}
+
+/// Start and finish dates saved as an interim plan (the Start1–10 and Finish1–10 fields).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterimPlan {
+    pub start: NaiveDateTime,
+    pub finish: NaiveDateTime,
 }
 
 /// Values computed by the scheduler. Never edit directly.
@@ -313,6 +334,16 @@ pub struct TaskSchedule {
     /// Duration of summary tasks (computed span); leaf tasks mirror `Task::duration`.
     pub duration: Minutes,
     pub percent_complete: f32,
+    /// End of the completed part of an in-progress task (Microsoft Project's Stop field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<NaiveDateTime>,
+    /// Start of the remaining part of an in-progress task: the next working moment after the stop,
+    /// or the start of the next part when the task pauses at its stop (Microsoft Project's Resume).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<NaiveDateTime>,
+    /// The working parts (start, finish) of a split task, in order; empty when it is not split.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<(NaiveDateTime, NaiveDateTime)>,
     /// Human-readable scheduling problems (constraint conflicts, missed deadlines...).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -371,6 +402,26 @@ pub struct Task {
     pub manual_start: Option<NaiveDateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_finish: Option<NaiveDateTime>,
+    /// Pauses in an in-progress task (set with a later Resume date, or by rescheduling uncompleted
+    /// work): the task's working time is laid out from its actual start, and after each split's
+    /// `work` it stops until that split's `resume`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub splits: Vec<Split>,
+    /// Splits planned in the task (Split Task): pauses that move with it. See [`Gap`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<Gap>,
+    /// A recurring task: this summary's subtasks are its occurrences (see [`crate::recurring`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence_pattern: Option<crate::recurring::Recurrence>,
+    /// An occurrence of a recurring task (made by it, and changed with it).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub occurrence: bool,
+    /// The Task Board column the task is in (Board Status); `None`: the first column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_status: Option<BoardColumnId>,
+    /// Whether the task shows on the Task Board (Show on Board).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub show_on_board: bool,
     /// Delay added by resource leveling (working minutes).
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub leveling_delay: Minutes,
@@ -378,8 +429,15 @@ pub struct Task {
     pub fixed_cost: f64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
+    /// Baseline (number 0): the one variance is measured against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<Baseline>,
+    /// Baselines 1–10, by number (see [`crate::baseline`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "crate::baseline::lenient_slots")]
+    pub baselines: std::collections::BTreeMap<u8, Baseline>,
+    /// Interim plans 1–10, by number.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "crate::baseline::lenient_slots")]
+    pub interim: std::collections::BTreeMap<u8, InterimPlan>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_on_timeline: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -390,12 +448,6 @@ pub struct Task {
     /// When the fixed cost is incurred.
     #[serde(default, skip_serializing_if = "Accrual::is_default")]
     pub fixed_cost_accrual: Accrual,
-    /// Baselines 1–10 (Baseline 0 is `baseline`).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub baselines: BTreeMap<u8, Baseline>,
-    /// Interim plans (Start1/Finish1 … Start10/Finish10).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub interim: BTreeMap<u8, InterimPlan>,
     /// Set on the summary task created by "Recurring Task".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recurrence: Option<Recurrence>,
@@ -405,6 +457,9 @@ pub struct Task {
     /// "Update Project ▸ Reschedule uncompleted work": the unfinished part resumes here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<NaiveDateTime>,
+    /// Values of the project's custom fields (see [`crate::custom`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub custom: std::collections::BTreeMap<CustomFieldId, crate::custom::CustomValue>,
     #[serde(default)]
     pub sched: TaskSchedule,
 }
@@ -413,6 +468,9 @@ fn one_u16() -> u16 {
     1
 }
 fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+fn is_zero_u8(v: &u8) -> bool {
     *v == 0
 }
 fn is_zero_f64(v: &f64) -> bool {
@@ -446,19 +504,26 @@ impl Task {
             actual_finish: None,
             manual_start: None,
             manual_finish: None,
+            splits: Vec::new(),
+            gaps: Vec::new(),
+            recurrence_pattern: None,
+            occurrence: false,
+            board_status: None,
+            show_on_board: true,
             leveling_delay: 0,
             fixed_cost: 0.0,
             notes: String::new(),
             baseline: None,
+            baselines: std::collections::BTreeMap::new(),
+            interim: std::collections::BTreeMap::new(),
             show_on_timeline: false,
             bar_color: None,
             hyperlink: None,
             fixed_cost_accrual: Accrual::default(),
-            baselines: BTreeMap::new(),
-            interim: BTreeMap::new(),
             recurrence: None,
             attachments: Vec::new(),
             resume: None,
+            custom: std::collections::BTreeMap::new(),
             sched: TaskSchedule::default(),
         }
     }
@@ -481,6 +546,36 @@ impl Task {
 
     pub fn is_complete(&self) -> bool {
         self.percent_complete >= 100
+    }
+
+    /// Working time done so far: % complete of the duration (Microsoft Project's Actual Duration).
+    pub fn actual_duration(&self) -> Minutes {
+        if self.is_milestone() {
+            return 0;
+        }
+        self.duration.max(0).saturating_mul(Minutes::from(self.percent_complete.min(100))) / 100
+    }
+
+    /// Working time still to do (Microsoft Project's Remaining Duration).
+    pub fn remaining_duration(&self) -> Minutes {
+        if self.is_milestone() {
+            return 0;
+        }
+        self.duration.max(0).saturating_sub(self.actual_duration())
+    }
+
+    /// Actual and remaining duration as shown in tables and reports. A summary's come from its
+    /// rolled-up duration and % complete; a leaf's from [`Task::actual_duration`].
+    pub fn duration_progress(&self) -> (Minutes, Minutes) {
+        if !self.sched.is_summary {
+            return (self.actual_duration(), self.remaining_duration());
+        }
+        let total = self.sched.duration.max(0);
+        let pct = f64::from(self.sched.percent_complete);
+        let pct = if pct.is_finite() { pct.clamp(0.0, 100.0) } else { 0.0 };
+        let done = ((total as f64) * pct / 100.0).round() as Minutes;
+        let done = done.clamp(0, total);
+        (done, total.saturating_sub(done))
     }
 
     /// Whether adding or removing people keeps total work the same. Fixed Work tasks always are.
@@ -828,6 +923,9 @@ pub struct ProjectSettings {
     /// Custom WBS code mask; empty uses outline numbers.
     #[serde(skip_serializing_if = "WbsMask::is_empty")]
     pub wbs: WbsMask,
+    /// The baseline (0–10) earned value is measured against.
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    pub earned_value_baseline: u8,
 }
 
 impl Default for ProjectSettings {
@@ -845,6 +943,7 @@ impl Default for ProjectSettings {
             schedule_from_finish: false,
             finish_date: None,
             wbs: WbsMask::default(),
+            earned_value_baseline: 0,
         }
     }
 }
@@ -898,6 +997,18 @@ pub struct Project {
     pub time_entries: Vec<TimeEntry>,
     #[serde(default)]
     pub external_projects: Vec<ExternalProject>,
+    /// User-defined task fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_fields: Vec<crate::custom::CustomFieldDef>,
+    /// Columns chosen for task tables, by table name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<crate::custom::TableLayout>,
+    /// The Task Board's columns, in order (see [`crate::board`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub board_columns: Vec<crate::board::BoardColumn>,
+    /// Page Setup for printing and PDF export.
+    #[serde(default, skip_serializing_if = "crate::print::PageSetup::is_default", deserialize_with = "crate::print::lenient_page_setup")]
+    pub page_setup: crate::print::PageSetup,
     #[serde(default)]
     pub ids: IdCounters,
     #[serde(default)]
@@ -913,6 +1024,7 @@ impl Project {
         let night = ids.next_calendar();
         let settings = ProjectSettings::default();
         let start_time = crate::calendar::shift(start.and_time(chrono::NaiveTime::MIN), Minutes::from(settings.time.default_start_time));
+        let board_columns = crate::board::default_columns(&mut ids);
         Self {
             format: FILE_FORMAT.into(),
             version: FILE_VERSION,
@@ -933,6 +1045,10 @@ impl Project {
             assignments: Vec::new(),
             time_entries: Vec::new(),
             external_projects: Vec::new(),
+            custom_fields: Vec::new(),
+            tables: Vec::new(),
+            board_columns,
+            page_setup: crate::print::PageSetup::default(),
             ids,
             sched: ProjectSchedule::default(),
         }
@@ -1088,12 +1204,7 @@ pub struct Hyperlink {
     pub address: String,
 }
 
-/// Start and finish saved as an interim plan.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-pub struct InterimPlan {
-    pub start: NaiveDateTime,
-    pub finish: NaiveDateTime,
-}
+pub type Interim = InterimPlan;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]

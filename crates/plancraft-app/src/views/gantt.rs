@@ -7,15 +7,45 @@ use plancraft_core::prelude::*;
 use plancraft_core::schedule::task_calendar;
 use plancraft_core::workspace::{ChangeSource, Document};
 
-use crate::columns::{self, CellCtx, TaskCol};
+use crate::columns::{CellCtx, TaskCol};
 use crate::commands::Command;
 use crate::edit::EditExt;
+use crate::fields::{self, Field};
 use crate::state::{ToastKind, UiState};
 use crate::theme;
-use crate::views::gantt_chart::{self, ChartAction, ChartInput};
+use crate::views::gantt_chart::{self, ChartAction, ChartInput, ChartKind};
+use crate::views::{GroupRow, Row};
 use crate::widgets::grid::{self, GridConfig, GridEvent};
 
 pub const BLANK_ROWS: usize = 20;
+
+/// Blank rows below the tasks (for typing new tasks), only in the plain outline.
+pub fn blank_rows(st: &UiState) -> usize {
+    if st.filter == crate::state::TaskFilter::All && st.search.is_empty() && st.group.is_none() { BLANK_ROWS } else { 0 }
+}
+
+/// The cell of a group header row: the value and count under the name column, the span and
+/// totals under date, work and cost columns.
+pub(crate) fn group_cell(field: Field, p: &Project, g: &GroupRow) -> grid::Cell {
+    let tasks: Vec<&Task> = g.tasks.iter().filter_map(|&i| p.tasks.get(i)).collect();
+    let start = tasks.iter().filter_map(|t| t.sched.start).min();
+    let finish = tasks.iter().filter_map(|t| t.sched.finish).max();
+    let text = match field {
+        Field::Builtin(TaskCol::Name) => format!("{}  ({})", g.label, g.tasks.len()),
+        Field::Builtin(TaskCol::Start) => crate::format::date(start),
+        Field::Builtin(TaskCol::Finish) => crate::format::date(finish),
+        Field::Builtin(TaskCol::Work) => format_work(tasks.iter().fold(0, |a: Minutes, t| a.saturating_add(t.sched.work))),
+        Field::Builtin(TaskCol::Cost) => crate::format::money(p, tasks.iter().map(|t| t.sched.cost).sum()),
+        _ => String::new(),
+    };
+    grid::Cell {
+        text,
+        bold: true,
+        bg: Some(theme::pal().HEADER_BG),
+        expander: (field == Field::Builtin(TaskCol::Name)).then_some(!g.collapsed),
+        ..Default::default()
+    }
+}
 
 /// Shows the task table (shared by Gantt-type views). Returns the grid output.
 pub fn task_table(
@@ -23,92 +53,144 @@ pub fn task_table(
     rect: Rect,
     doc: &mut Document,
     st: &mut UiState,
-    rows: &[usize],
+    rows: &[Row],
     show_vscroll: bool,
     out: &mut Vec<Command>,
 ) -> grid::GridOutput {
-    let cols: Vec<TaskCol> = st.table.columns();
-    let defs: Vec<grid::ColumnDef> = cols.iter().map(|c| c.def(&doc.project)).collect();
+    let fields: Vec<Field> = fields::table_fields(&doc.project, st.table);
+    let sort = st.sort.clone();
+    let defs: Vec<grid::ColumnDef> = fields
+        .iter()
+        .map(|f| {
+            let desc = sort.as_ref().filter(|(k, _)| *k == f.key()).map(|(_, d)| *d);
+            f.def(&doc.project).sorted(desc)
+        })
+        .collect();
+    // Column widths follow the field, so adding or moving columns keeps everyone's width.
+    st.task_grid.widths =
+        fields.iter().zip(&defs).map(|(f, d)| st.column_widths.get(&(st.table, f.key())).copied().unwrap_or(d.width)).collect();
     let over_res: HashSet<ResourceId> = plancraft_core::workload::overallocations(&doc.project).into_iter().map(|(r, _)| r).collect();
     let over_tasks = super::overallocated_tasks(&doc.project, &over_res);
-    let blank = if st.filter == crate::state::TaskFilter::All && st.search.is_empty() { BLANK_ROWS } else { 0 };
-    let row_label = |r: usize| match rows.get(r) {
-        Some(&i) if i < doc.project.tasks.len() => (i + 1).to_string(),
-        _ => String::new(),
-    };
-    let cfg = GridConfig {
-        id: egui::Id::new(("task_grid", st.table.label())),
-        columns: &defs,
-        row_count: rows.len(),
-        blank_rows: blank,
-        row_numbers: true,
-        show_vscroll,
-        header_height: theme::HEADER_HEIGHT,
-        row_height: theme::ROW_HEIGHT,
-        row_label: Some(&row_label),
-        spreadsheet: true,
-    };
+    let blank = blank_rows(st);
+    // The cursor and an open editor follow their task when the rows re-sort or regroup (after
+    // an edit, or an agent's change), so typing never lands on another task.
+    if (st.sort.is_some() || st.group.is_some())
+        && let Some((was, id)) = st.cursor_task
+        && let Some((row, col)) = st.task_grid.cursor
+        && row == was
+        && super::task_at(&doc.project, rows, row).is_none_or(|t| t.id != id)
+        && let Some(now) = doc.project.task_index(id).and_then(|i| super::row_of_task(rows, i))
+    {
+        st.task_grid.cursor = Some((now, col));
+        if let Some(e) = st.task_grid.editing.as_mut()
+            && e.row == was
+        {
+            e.row = now;
+        }
+        st.task_grid.scroll_to = Some(now);
+    }
     let output = {
         let p = &doc.project;
+        // Rows show the task's row number (what predecessors refer to), also when sorted or grouped.
+        let row_label = |r: usize| rows.get(r).and_then(Row::task).map_or_else(String::new, |i| (i + 1).to_string());
+        let cfg = GridConfig {
+            id: egui::Id::new(("task_grid", st.table.label())),
+            columns: &defs,
+            row_count: rows.len(),
+            spreadsheet: true,
+            blank_rows: blank,
+            row_numbers: true,
+            row_label: Some(&row_label),
+            show_vscroll,
+            header_height: theme::HEADER_HEIGHT,
+            row_height: theme::ROW_HEIGHT,
+        };
         let sel = &st.sel;
         let collapsed = &st.collapsed;
         let is_over = |id: TaskId| over_tasks.contains(&id);
         let ctx = CellCtx { overallocated: &is_over };
-        let is_selected = |r: usize| super::task_at(p, rows, r).is_some_and(|t| sel.tasks.contains(&t.id));
-        let mut cell = |r: usize, c: usize| {
-            let (Some(&idx), Some(&col)) = (rows.get(r), cols.get(c)) else { return grid::Cell::default() };
-            if let Some(h) = super::group_header(idx) {
-                return group_cell(p, &h, col, !st.collapsed_groups.contains(&h.label));
+        let is_selected = |r: usize| match rows.get(r) {
+            Some(Row::Group(g)) => {
+                !g.tasks.is_empty() && g.tasks.iter().all(|&i| p.tasks.get(i).is_some_and(|t| sel.tasks.contains(&t.id)))
             }
-            let mut cell = columns::cell(col, p, idx, &ctx);
-            if col == TaskCol::Name && cell.expander.is_some() {
-                cell.expander = Some(!p.tasks.get(idx).is_some_and(|t| collapsed.contains(&t.id)));
-            } else if col == TaskCol::Name {
-                cell.indent += 14.0;
+            _ => super::task_at(p, rows, r).is_some_and(|t| sel.tasks.contains(&t.id)),
+        };
+        let grouped = st.group.is_some();
+        let mut cell = |r: usize, c: usize| {
+            let (Some(row), Some(&field)) = (rows.get(r), fields.get(c)) else { return grid::Cell::default() };
+            let idx = match row {
+                Row::Group(g) => return group_cell(field, p, g),
+                Row::Task(idx) => *idx,
+            };
+            let mut cell = field.cell(p, idx, &ctx);
+            if field == Field::Builtin(TaskCol::Name) {
+                if grouped {
+                    // Grouped rows are not an outline: no indent or summary toggles.
+                    cell.indent = 14.0;
+                    cell.expander = None;
+                } else if cell.expander.is_some() {
+                    cell.expander = Some(!p.tasks.get(idx).is_some_and(|t| collapsed.contains(&t.id)));
+                } else {
+                    cell.indent += 14.0;
+                }
             }
             cell
         };
         grid::show(ui, rect, &mut st.task_grid, &cfg, &is_selected, &mut cell)
     };
+    for (f, w) in fields.iter().zip(&st.task_grid.widths) {
+        st.column_widths.insert((st.table, f.key()), *w);
+    }
 
     for ev in output.events.clone() {
         match ev {
             GridEvent::Select { row, shift, ctrl } => super::select_row(&mut st.sel, &doc.project, rows, row, shift, ctrl),
-            GridEvent::CursorRow { row, shift } => super::select_row(&mut st.sel, &doc.project, rows, row, shift, false),
-            GridEvent::Activate { row, .. } => {
-                super::select_row(&mut st.sel, &doc.project, rows, row, false, false);
-                out.push(Command::TaskInfo);
-            }
-            GridEvent::ToggleExpand(row) => {
-                if let Some(h) = rows.get(row).and_then(|&i| super::group_header(i)) {
-                    if !st.collapsed_groups.remove(&h.label) {
-                        st.collapsed_groups.insert(h.label);
+            GridEvent::CursorRow { row, shift } => {
+                // Arrowing onto a group header selects nothing (a click selects the group), so a
+                // key pressed next can't act on the whole group by surprise.
+                if matches!(rows.get(row), Some(Row::Group(_))) {
+                    if !shift {
+                        st.sel.tasks.clear();
                     }
-                    continue;
-                }
-                let Some(id) = super::task_at(&doc.project, rows, row).map(|t| t.id) else { continue };
-                if !st.collapsed.remove(&id) {
-                    st.collapsed.insert(id);
+                } else {
+                    super::select_row(&mut st.sel, &doc.project, rows, row, shift, false);
                 }
             }
+            GridEvent::Activate { row, .. } => {
+                if super::task_at(&doc.project, rows, row).is_some() {
+                    super::select_row(&mut st.sel, &doc.project, rows, row, false, false);
+                    out.push(Command::TaskInfo);
+                }
+            }
+            GridEvent::ToggleExpand(row) => match rows.get(row) {
+                Some(Row::Group(g)) => {
+                    if !st.collapsed_groups.remove(&g.label) {
+                        st.collapsed_groups.insert(g.label.clone());
+                    }
+                }
+                _ => {
+                    let Some(id) = super::task_at(&doc.project, rows, row).map(|t| t.id) else { continue };
+                    if !st.collapsed.remove(&id) {
+                        st.collapsed.insert(id);
+                    }
+                }
+            },
             GridEvent::Commit { row, col, text } => {
-                let (Some(&column), Some(def)) = (cols.get(col), defs.get(col)) else { continue };
+                let (Some(&field), Some(def)) = (fields.get(col), defs.get(col)) else { continue };
                 if row < rows.len() {
                     let Some(id) = super::task_at(&doc.project, rows, row).map(|t| t.id) else { continue };
-                    if !columns::can_edit(column, &doc.project, id) {
-                        continue;
-                    }
-                    let label = crate::tr_dyn(&format!("Edit {}", def.title));
-                    if let Err(e) = doc.edit_msg(&label, |p| columns::commit(column, p, id, &text)) {
+                    let label = format!("Edit {}", def.title);
+                    if let Err(e) = doc.edit_msg(&label, |p| field.commit(p, id, &text)) {
                         st.toast(ToastKind::Error, e);
                     }
                 } else if !text.is_empty() {
                     // Typing into a blank row creates a task.
-                    let r = doc.edit_msg(crate::tr("New Task"), |p| {
-                        let name = if column == TaskCol::Name { text.clone() } else { crate::tr("New Task").to_string() };
+                    let r = doc.edit_msg("New Task", |p| {
+                        let is_name = field == Field::Builtin(TaskCol::Name);
+                        let name = if is_name { text.clone() } else { "New Task".to_string() };
                         let id = p.add_task(name, None);
-                        if column != TaskCol::Name {
-                            columns::commit(column, p, id, &text)?;
+                        if !is_name {
+                            field.commit(p, id, &text)?;
                         }
                         Ok::<TaskId, String>(id)
                     });
@@ -118,8 +200,10 @@ pub fn task_table(
                     }
                 }
             }
-            GridEvent::PasteCells { row, col, text } => super::gantt_cells::paste(doc, st, rows, &cols, row, col, &text),
-            GridEvent::ContextMenu { row, .. } => {
+            GridEvent::PasteCells { row, col, text } => super::gantt_cells::paste(doc, st, rows, &fields, row, col, &text),
+            GridEvent::ContextMenu { row, pos } => {
+                output.body_response.request_focus();
+                st_context_menu(ui, pos);
                 // Resolve the row at the context-menu event itself. Keeping this
                 // together avoids opening the menu against a stale selection if
                 // the separate Select event is not delivered for this click.
@@ -134,31 +218,163 @@ pub fn task_table(
             GridEvent::ClickEmpty { .. } => {
                 st.sel.tasks.clear();
             }
+            GridEvent::HeaderClick { col } => {
+                // Ascending, then descending, then back to the outline order.
+                let Some(key) = fields.get(col).map(Field::key) else { continue };
+                let next = match &st.sort {
+                    Some((k, false)) if *k == key => Some((key, true)),
+                    Some((k, true)) if *k == key => None,
+                    _ => Some((key, false)),
+                };
+                out.push(Command::SortBy(next));
+            }
+            GridEvent::HeaderMenu { col, pos } => {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("column_menu"), (pos, col)));
+            }
         }
     }
-    output.body_response.context_menu(|ui| {
-        crate::commands::task_context_menu(ui, &mut |command| out.push(command));
-    });
+    st.cursor_task = st.task_grid.cursor.and_then(|(r, _)| super::task_at(&doc.project, rows, r).map(|t| (r, t.id)));
     output
 }
 
-/// A group header row ("Group by"): the group name and the totals of its tasks.
-fn group_cell(p: &Project, h: &super::GroupHeader, col: TaskCol, expanded: bool) -> grid::Cell {
-    let text = match col {
-        TaskCol::Name => format!("{}  ({})", h.label, h.tasks),
-        TaskCol::Start => crate::format::date(h.start),
-        TaskCol::Finish => crate::format::date(h.finish),
-        TaskCol::Cost => crate::format::money(p, h.cost),
-        TaskCol::Work => plancraft_core::duration::format_work(h.work),
-        TaskCol::PercentComplete => crate::format::percent(h.percent),
-        _ => String::new(),
+fn st_context_menu(ui: &Ui, pos: egui::Pos2) {
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("task_ctx_menu"), pos));
+}
+
+/// Keeps a popup (an [`egui::Area`] at a stored position) open until a choice, Escape or a
+/// click elsewhere. Returns whether it should close.
+fn popup_area(ctx: &egui::Context, id: egui::Id, pos: egui::Pos2, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let mut chosen = false;
+    let resp = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
+        egui::Frame::menu(ui.style()).show(ui, |ui| {
+            ui.set_min_width(200.0);
+            chosen = add(ui);
+        });
+    });
+    let clicked_outside = ctx.input(|i| i.pointer.any_pressed()) && !resp.response.contains_pointer() && resp.response.rect.width() > 0.0;
+    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    // The first frame after opening sees the opening click; ignore it.
+    let fresh = ctx.data_mut(|d| {
+        let f = d.get_temp::<bool>(id.with("fresh")).unwrap_or(true);
+        d.insert_temp(id.with("fresh"), false);
+        f
+    });
+    let close = chosen || esc || (clicked_outside && !fresh);
+    if close {
+        ctx.data_mut(|d| d.remove::<bool>(id.with("fresh")));
+    }
+    close
+}
+
+/// Shows the floating context menu requested by the task table, if any.
+pub fn context_menu_popup(ctx: &egui::Context, out: &mut Vec<Command>) {
+    let id = egui::Id::new("task_ctx_menu");
+    let Some(pos) = ctx.data(|d| d.get_temp::<egui::Pos2>(id)) else {
+        return;
     };
-    grid::Cell {
-        text,
-        bold: true,
-        bg: Some(theme::pal().HEADER_BG),
-        expander: (col == TaskCol::Name).then_some(expanded),
-        ..Default::default()
+    let close = popup_area(ctx, id, pos, |ui| {
+        let mut picked = false;
+        crate::commands::task_context_menu(ui, &mut |c| {
+            out.push(c);
+            picked = true;
+        });
+        picked
+    });
+    if close {
+        ctx.data_mut(|d| d.remove::<egui::Pos2>(id));
+    }
+}
+
+/// Shows the column menu requested by a right-click on a task table header, if any: sort, group,
+/// insert, hide and move columns, and custom fields.
+pub fn column_menu_popup(ctx: &egui::Context, p: &Project, st: &UiState, out: &mut Vec<Command>) {
+    let id = egui::Id::new("column_menu");
+    let Some((pos, col)) = ctx.data(|d| d.get_temp::<(egui::Pos2, usize)>(id)) else {
+        return;
+    };
+    let shown = fields::table_fields(p, st.table);
+    let Some(field) = shown.get(col).copied() else {
+        ctx.data_mut(|d| d.remove::<(egui::Pos2, usize)>(id));
+        return;
+    };
+    let key = field.key();
+    let close = popup_area(ctx, id, pos, |ui| {
+        let mut cmd = None;
+        ui.label(egui::RichText::new(field.title(p)).strong());
+        ui.separator();
+        if ui.button(crate::tr("Sort Ascending")).clicked() {
+            cmd = Some(Command::SortBy(Some((key.clone(), false))));
+        }
+        if ui.button(crate::tr("Sort Descending")).clicked() {
+            cmd = Some(Command::SortBy(Some((key.clone(), true))));
+        }
+        if st.sort.is_some() && ui.button(crate::tr("Clear Sort")).clicked() {
+            cmd = Some(Command::SortBy(None));
+        }
+        ui.separator();
+        if ui.button(crate::tr("Group by This Field")).clicked() {
+            cmd = Some(Command::GroupBy(Some(key.clone())));
+        }
+        if st.group.is_some() && ui.button(crate::tr("Clear Group")).clicked() {
+            cmd = Some(Command::GroupBy(None));
+        }
+        ui.separator();
+        ui.menu_button("Insert Column", |ui| {
+            use crate::columns::TaskCol;
+            let hidden: Vec<Field> = fields::all_fields(p).into_iter().filter(|f| !shown.contains(f)).collect();
+            let mut pick = |ui: &mut egui::Ui, f: &Field| {
+                if ui.button(f.title(p)).clicked() {
+                    cmd = Some(Command::InsertColumn { at: col, key: f.key() });
+                }
+            };
+            // Baseline1–10 and the interim plans go in submenus so the list stays short.
+            let numbered = |f: &Field, n: u8| matches!(f, Field::Builtin(TaskCol::Baseline(m, _)) if *m == n);
+            let interim = |f: &Field| matches!(f, Field::Builtin(TaskCol::Interim(..)));
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                for f in hidden.iter().filter(|f| !interim(f) && !(1..=plancraft_core::baseline::MAX_BASELINE).any(|n| numbered(f, n))) {
+                    pick(ui, f);
+                }
+                ui.separator();
+                ui.menu_button("Baseline1–10", |ui| {
+                    for n in 1..=plancraft_core::baseline::MAX_BASELINE {
+                        ui.menu_button(PlanSlot::Baseline(n).name(), |ui| {
+                            for f in hidden.iter().filter(|f| numbered(f, n)) {
+                                pick(ui, f);
+                            }
+                        });
+                    }
+                });
+                ui.menu_button("Interim Plans", |ui| {
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for f in hidden.iter().filter(|f| interim(f)) {
+                            pick(ui, f);
+                        }
+                    });
+                });
+            });
+        });
+        if ui.add_enabled(shown.len() > 1, egui::Button::new(crate::tr("Hide Column"))).clicked() {
+            cmd = Some(Command::HideColumn(col));
+        }
+        if ui.add_enabled(col > 0, egui::Button::new(crate::tr("Move Left"))).clicked() {
+            cmd = Some(Command::MoveColumn { at: col, right: false });
+        }
+        if ui.add_enabled(col + 1 < shown.len(), egui::Button::new(crate::tr("Move Right"))).clicked() {
+            cmd = Some(Command::MoveColumn { at: col, right: true });
+        }
+        if p.table_layout(st.table.label()).is_some() && ui.button(crate::tr("Reset Columns")).clicked() {
+            cmd = Some(Command::ResetColumns);
+        }
+        ui.separator();
+        if ui.button(crate::tr("Custom Fields…")).clicked() {
+            cmd = Some(Command::CustomFields);
+        }
+        let picked = cmd.is_some();
+        out.extend(cmd);
+        picked
+    });
+    if close {
+        ctx.data_mut(|d| d.remove::<(egui::Pos2, usize)>(id));
     }
 }
 
@@ -176,7 +392,7 @@ pub fn splitter(ui: &mut Ui, x: f32, rect: Rect, width: &mut f32) {
     ui.painter().vline(x + 2.0, rect.y_range(), Stroke::new(1.0, theme::pal().GRID_LINE_STRONG));
 }
 
-pub fn show(ui: &mut Ui, rect: Rect, doc: &mut Document, st: &mut UiState, tracking: bool, out: &mut Vec<Command>) {
+pub fn show(ui: &mut Ui, rect: Rect, doc: &mut Document, st: &mut UiState, kind: ChartKind, out: &mut Vec<Command>) {
     let rows = super::visible_rows(&doc.project, st);
     let table_w = st.table_width.min(rect.width() - 160.0).max(120.0);
     let table_rect = Rect::from_min_size(rect.min, vec2(table_w, rect.height()));
@@ -185,7 +401,7 @@ pub fn show(ui: &mut Ui, rect: Rect, doc: &mut Document, st: &mut UiState, track
     task_table(ui, table_rect, doc, st, &rows, false, out);
     splitter(ui, rect.left() + table_w + 2.0, rect, &mut st.table_width);
 
-    let blank = if st.filter == crate::state::TaskFilter::All && st.search.is_empty() { BLANK_ROWS } else { 0 };
+    let blank = blank_rows(st);
     let actions = {
         let sel = &st.sel;
         let is_sel = |id: TaskId| sel.tasks.contains(&id);
@@ -193,7 +409,7 @@ pub fn show(ui: &mut Ui, rect: Rect, doc: &mut Document, st: &mut UiState, track
             project: &doc.project,
             rows: &rows,
             selected: &is_sel,
-            tracking,
+            kind,
             row_height: theme::ROW_HEIGHT,
             header_height: theme::HEADER_HEIGHT,
             blank_rows: blank,
@@ -203,13 +419,20 @@ pub fn show(ui: &mut Ui, rect: Rect, doc: &mut Document, st: &mut UiState, track
     apply_chart_actions(doc, st, &rows, actions, out);
 }
 
-pub fn apply_chart_actions(doc: &mut Document, st: &mut UiState, rows: &[usize], actions: Vec<ChartAction>, out: &mut Vec<Command>) {
+/// A duration dragged on the chart, rounded to whole days (or hours below half a day).
+fn round_dragged(p: &Project, mins: Minutes) -> Minutes {
+    let day = p.settings.time.minutes_per_day.max(1);
+    if mins >= day / 2 { ((mins + day / 2) / day * day).max(day) } else { (mins + 30) / 60 * 60 }
+}
+
+pub fn apply_chart_actions(doc: &mut Document, st: &mut UiState, rows: &[Row], actions: Vec<ChartAction>, out: &mut Vec<Command>) {
     for a in actions {
         match a {
             ChartAction::Select { task, shift, ctrl } => {
-                if let Some(r) = rows.iter().position(|&i| doc.project.tasks.get(i).is_some_and(|t| t.id == task)) {
+                if let Some(r) = doc.project.task_index(task).and_then(|i| super::row_of_task(rows, i)) {
                     super::select_row(&mut st.sel, &doc.project, rows, r, shift, ctrl);
-                    st.task_grid.select_row(r, shift);
+                    st.task_grid.cursor = Some((r, st.task_grid.cursor.map(|c| c.1).unwrap_or(2)));
+                    st.cursor_task = Some((r, task));
                 } else {
                     st.sel.select_task(task);
                 }
@@ -236,18 +459,75 @@ pub fn apply_chart_actions(doc: &mut Document, st: &mut UiState, rows: &[usize],
                     st.toast(ToastKind::Warning, e);
                 }
             }
+            ChartAction::Split { task, at } => {
+                let r = doc.edit_msg("Split Task", |p| {
+                    let idx = p.task_index(task).ok_or("task not found")?;
+                    let cal = task_calendar(p, idx);
+                    // Zoomed out, split at the end of the day clicked; zoomed in, at the hour.
+                    let at = if st.gantt.px_per_day >= 72.0 {
+                        let midnight = at.date().and_time(chrono::NaiveTime::MIN);
+                        plancraft_core::calendar::shift(midnight, ((at - midnight).num_minutes() + 30) / 60 * 60)
+                    } else {
+                        cal.day_finish(at.date())
+                    };
+                    // A pause of one working day of the task's calendar.
+                    let resume_from = cal.snap_forward(at);
+                    let day = Some(cal.working_minutes_on(resume_from.date()))
+                        .filter(|m| *m > 0)
+                        .unwrap_or(p.settings.time.minutes_per_day.max(1));
+                    let resume = cal.snap_forward(cal.add(resume_from, day));
+                    p.split_task(task, at, resume).map_err(|e| e.to_string())
+                });
+                match r {
+                    Ok(()) => st.toast(ToastKind::Info, "Task split: drag the later part to move it, or back to rejoin"),
+                    Err(e) => st.toast(ToastKind::Warning, e),
+                }
+            }
+            ChartAction::MovePart { task, k, start } => {
+                let r = doc.edit_msg("Move Split Part", |p| {
+                    let idx = p.task_index(task).ok_or("task not found")?;
+                    let cal = task_calendar(p, idx);
+                    let prev_end = p.task(task).and_then(|t| t.sched.parts.get(k.wrapping_sub(1)).map(|x| x.1)).ok_or("no such part")?;
+                    // Moved back onto the part before it: the parts join.
+                    let length = cal.between(cal.snap_forward(prev_end), start).max(0);
+                    p.set_split_length(task, k.saturating_sub(1), length).map_err(|e| e.to_string())
+                });
+                if let Err(e) = r {
+                    st.toast(ToastKind::Warning, e);
+                }
+            }
+            ChartAction::SetPartFinish { task, k, finish } => {
+                let r = doc.edit_msg("Change Part Duration", |p| {
+                    let idx = p.task_index(task).ok_or("task not found")?;
+                    let cal = task_calendar(p, idx);
+                    let start = p.task(task).and_then(|t| t.sched.parts.get(k).map(|x| x.0)).ok_or("no such part")?;
+                    // Dragged onto or before its own start: no change (rejoin parts by moving them).
+                    let mins = round_dragged(p, cal.between(start, finish).max(0));
+                    if mins <= 0 {
+                        return Ok(());
+                    }
+                    p.set_part_duration(task, k, mins).map_err(|e| e.to_string())
+                });
+                if let Err(e) = r {
+                    st.toast(ToastKind::Warning, e);
+                }
+            }
             ChartAction::SetFinish { task, finish } => {
                 let r = doc.edit_msg(crate::tr("Change Duration"), |p| {
                     let idx = p.task_index(task).ok_or(crate::tr("task not found"))?;
                     let start = p.task(task).and_then(|t| t.sched.start).ok_or(crate::tr("task has no start"))?;
                     let cal = task_calendar(p, idx);
                     let mut mins = cal.between(start, finish).max(0);
-                    let day = p.settings.time.minutes_per_day.max(1);
-                    if mins >= day / 2 {
-                        mins = ((mins + day / 2) / day * day).max(day);
-                    } else {
-                        mins = (mins + 30) / 60 * 60;
+                    // A split task does no work during its pauses.
+                    if let Some(t) = p.task(task) {
+                        for w in t.sched.parts.windows(2) {
+                            if let [(_, stop), (resume, _)] = w {
+                                mins = mins.saturating_sub(cal.between(*stop, (*resume).min(finish)).max(0));
+                            }
+                        }
+                        mins = mins.max(0);
                     }
+                    let mins = round_dragged(p, mins);
                     let manual_finish = cal.add(start, mins);
                     if let Some(t) = p.task_mut(task)
                         && t.mode == ScheduleMode::Manual

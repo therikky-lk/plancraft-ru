@@ -16,13 +16,23 @@ This crate is pure logic with no UI. Every other component builds on it.
 | `model` | `Project`, `Task`, `Resource`, `Assignment`, `TimeEntry`, `ExternalProject`, `TaskRef`, `Dependency`, `Constraint`, `Estimate`, `Baseline`, and computed `TaskSchedule` / `ProjectSchedule` |
 | `ids` | Stable unique ids (`TaskId`, `ResourceId`, …) and their monotonic counters |
 | `duration` | Working-minute durations: formatting and parsing (`3d`, `4h`, `2w`, `3d?`) and lags (`2d`, `-1d`, `50%`, `3ed`) |
+| `custom` | Custom field definitions and values, and saved table layouts (column keys per table) |
+| `print` | Page Setup, page layout of a table with a Gantt chart (pages across and down, timescale, bars, links, legend, header/footer), the Network Diagram and Task Board as drawings (`print::network`, `print::board`) tiled over pages by `print::canvas` (fit to N pages wide or actual size), PDF writer that embeds subsets of every font a page uses (`print::pdf`, `print::subset`, with the `subsetter` crate for TrueType and CFF). Text prints in the bundled UI font, or in a system fallback font for scripts it lacks (`print::fallback` finds them from their character maps, `print::font::pick` chooses per character). The app's Print Preview paints the same pages |
+| `bidi` | Right-to-left text (Hebrew, Arabic) put in display order with the Unicode Bidirectional Algorithm, one paragraph per line. `visual` gives full display order for the PDF writer, which draws characters as given. `display` is for egui, which lays out each right-to-left run itself: runs and words go in display order, letters within a run stay in typing order |
+| `network` | Network Diagram layout: columns by dependency depth (loops, found as strongly connected components, are released once everything leading into them is placed), rows by path (optionally critical first), summaries beside their subtasks, collapsed summaries as one box, right-angled link routes and hit testing |
+| `timescale` | Timescale units and tiers shared by the chart, usage views, timeline and printing |
 | `calendar` | Working weeks, exceptions (including yearly ones), and `WorkCal` date arithmetic: add/sub working time, snapping, and working minutes between two times |
 | `schedule` | The CPM engine (`recalculate`) |
-| `ops` | All editing operations: outline, links, milestones, the duration/work/units rules, assignments, progress, time logging, baselines, calendars, and text parsing for the table columns |
+| `ops` | All editing operations: outline, links, milestones, the duration/work/units rules, assignments, progress, time logging, calendars, and text parsing for the table columns |
+| `baseline` | Baseline and Baseline1–10, interim plans (Start1–10/Finish1–10): saving for the entire project or selected tasks with roll-up into summaries, copying between them, clearing, and per-plan totals |
+| `split` | Split Task: pauses planned in a task (`Gap`: after some work, a pause of some working time) that move with it; the scheduler lays the parts out (`schedule::segments_of`) |
+| `board` | The Task Board: its columns (Board Status values, each with an optional Set % Complete), which column a task's card is in, and moving cards and columns |
+| `recurring` | Recurring tasks: the patterns, occurrence dates, and the summary-with-occurrences each one is |
 | `workload` | Time-phased distribution (with contours), capacity, overallocation, and workload reports |
-| `leveling` | Serial resource leveling that writes `leveling_delay` |
+| `leveling` | Serial resource leveling that writes `leveling_delay`. It keeps loads incrementally and recalculates only when a delay can move other tasks. |
 | `report` | Statistics, milestone status, lateness, earned value |
 | `io` | `.plancraft` JSON load/save, relative paths, external-link refresh |
+| `mspdi` | Microsoft Project XML (MSPDI) import and export, from Microsoft's published schema reference. `mspdi::xml` streams the file one record (task, resource, assignment, calendar) at a time on `quick-xml` with depth, size and entity limits; `read` maps records into a `Project` (recurring calendar exceptions expanded into dates, resource calendars into personal exceptions) and `write` writes elements in the schema's order. Both return notes on what did not carry over |
 | `workspace` | Open documents with undo/redo snapshots and change attribution (user vs agent) |
 | `sample` | The demo project |
 
@@ -55,14 +65,17 @@ So a vacation of any assigned person pauses the task. Lags and summary durations
 4. **Topological sort** (Kahn). Cycles are reported and broken.
 5. **Forward pass:**
    - Applies all four link types with lags.
-   - Applies constraints: SNET/FNET push the task later; MSO/MFO pin it; SNLT/FNLT are honored and flagged when violated.
+   - Applies constraints: SNET/FNET push the task later; MSO/MFO pin it; SNLT/FNLT are honored and flagged when violated. A Start No Earlier Than date on a summary drives all of its subtasks.
    - Adds leveling delays.
    - Uses actual start and finish when they are set.
    - Manual tasks keep their entered dates.
-6. **Backward pass.** It computes late dates, limited by the project finish, deadlines and constraints.
+6. **Backward pass.** It computes late dates, limited by the project finish, deadlines (a task's own and its summaries') and constraints. Inactive successors are skipped. A link from a summary's start binds only the subtask that sets that start.
 7. **ALAP pass.** As-late-as-possible tasks are pinned to their late start, and the passes run again so successors stay consistent.
 8. **Slack.** Total and free slack are computed per leaf. A task is critical when total slack ≤ the threshold.
-9. **Roll up summaries and the project:** dates, work, cost and duration-weighted % complete.
+9. **Roll up summaries and the project:**
+   - Dates, work and cost. A summary's own fixed cost and assignments are added on top of its subtasks'.
+   - % complete, weighted by the durations of all subtasks below. Nested summaries and the project agree.
+   - A missed summary deadline is flagged.
 
 ### Duration, work and units
 
@@ -82,7 +95,7 @@ Scheduling only ever reads the snapshots, so a file opens and schedules even whe
 
 ### Undo and attribution
 
-`Document::edit` and `Document::try_edit` snapshot the project, apply the change, validate it against `limits`, recalculate and bump `revision`. Both return a `Result` and roll back on error. Each snapshot records whether the user or an agent made the change. Projects are small, so whole-project snapshots are simple and reliable.
+`Document::edit` and `Document::try_edit` snapshot the project, apply the change, validate it against `limits`, recalculate and bump `revision`. Both return a `Result` and roll back on error. Each snapshot records whether the user or an agent made the change. Whole-project snapshots are simple and reliable. The history keeps up to 200 steps within an estimated 256 MiB per document, dropping the oldest first.
 
 ### Robustness
 
@@ -99,7 +112,7 @@ The MCP server is a hand-rolled JSON-RPC 2.0 server. It has no async runtime, wh
   - Tool errors come back as `isError` results.
   - Each request locks the shared workspace briefly.
   - The change callback runs after the lock is released.
-- **`tools/*`:** 67 tools grouped by domain.
+- **`tools/*`:** 89 tools grouped by domain.
   - All mutations go through `Document::try_edit(…, ChangeSource::Agent, …)`.
   - Unknown arguments are rejected so agents find their typos.
 - **Transports:**
@@ -112,19 +125,21 @@ The MCP server is a hand-rolled JSON-RPC 2.0 server. It has no async runtime, wh
 The desktop app uses egui and eframe 0.36 with the wgpu renderer.
 
 - **`app`:** layout (title band, command bar, document tabs, status bar, vertical view label), keyboard shortcuts, command execution, dialogs, the unsaved-changes prompt, and agent-change detection.
-- **`menubar`:** the title band and the two-row command bar (a view selector spanning both rows, plain tabs with a File dropdown, and a single toolbar row).
-- **`start_page`:** the Start Page, a centered launcher with start actions, recent projects (with file dates) and a summary of the open project.
+- **`menubar`:** the green Office-style ribbon, with captioned groups that collapse as the window narrows.
+- **`start_page`:** the full-window File page, with an accent-colored navigation column, template gallery, export actions and options.
 - **`commands`:** the `Command` enum shared by the menu bar, toolbar, context menus and shortcuts.
 - **`widgets::grid`:** a virtualized spreadsheet grid with in-place text and choice editors, column resizing, keyboard navigation, and blank rows for entering new items.
 - **Task-grid selection and clipboard:** dragging the ID gutter selects task rows; dragging cells selects an inclusive rectangle with a visible outline. Shift+arrows/Shift+click extend the current selection; Shift+Space selects a task row. Row copies insert task snapshots. Cell copies export TSV (quoted tabs, quotes and multiline values); pastes overwrite existing display rows only, with a single undo/recalculation transaction. Single-value pastes can fill a selected rectangle. Calculated fields, summary duration/work and automatically scheduled start/finish dates are skipped without shifting the remaining values. Invalid editable values roll back the whole paste. `widgets::tsv` bounds clipboard size/counts; `views::gantt_cells` maps display rows to stable task IDs before applying values. Typing into a blank row still creates a task; cell-range paste never creates tasks.
 - **Structural task edits:** successful move up/down and indent/outdent commands switch from cell selection to task-row selection. The cursor follows the edited task ID in the current display order, and the grid scrolls it into view. Undo and Redo also follow the selected task when it remains visible. Indenting into a collapsed parent expands that parent so the task stays visible.
-- **`widgets::timescale`:** the two-tier timescale.
-- **`views/*`:** the ten views. The Gantt view combines the task grid with `gantt_chart`, which draws bars, links, milestone connectors and baselines and handles drag-to-move, resize, progress and link.
-- **`views::print_gantt`:** Windows printing via the system dialog (File > Print Gantt, Report ribbon, Ctrl+P). A4/A3, portrait/landscape, date pagination and row pagination share one immutable layout. Pages use the existing grid, Gantt and timescale painters on a scoped light palette. `raster` renders egui meshes and its font atlas at 300 dpi; preview and printer consume the same page images. The isolated `windows` module owns printer handles, submits pages through GDI, and aborts on failure. PDF creation belongs to the selected printer driver; the application has no PDF writer. Other platforms currently show an unsupported-printing message. Raster PDFs preserve appearance but do not provide searchable text. The Windows-only ignored driver test creates `target/print-proof-native.pdf` using Microsoft Print to PDF; it never submits a job to a physical printer.
+- **`widgets::timescale`:** the localized two-tier screen timescale; the print engine has its own shared core timescale.
+- **`fonts`:** adds the system fallback fonts to egui the first time a plan's text, typed text or a recent file name needs them.
+- **`printing` / `dialogs::print`:** the printed sheet built from the current view (columns left of the divider, sort, group and filter as on screen), or the Network Diagram or Task Board as on screen (filter, search, collapsed summaries, view options), the Print window with its preview, and hand-off to the system print service (`lp`; the native printer boundary on Windows) in a background thread with a timeout.
+- **`views/*`:** the thirteen views. The Gantt view (also the Tracking Gantt and the Multiple Baselines Gantt) combines the task grid with `gantt_chart`, which draws bars, links, milestone connectors and baselines and handles drag-to-move, resize, progress and link. `network` draws the core's Network Diagram layout (cached per edit) and handles selection, Task Information, drag-to-link, panning and zoom. `board` paints the Task Board's columns and cards and handles selection, dragging cards between columns and the column menu.
+- **`views::print_gantt`:** retains the edition's native Gantt printing and CPU rasterizer. The shared PDF preview also uses this Windows printer boundary, rasterizing the same page items at 300 dpi. `Ctrl+P` opens the shared preview; `Ctrl+Shift+P` opens the original Gantt preview. `Microsoft Print to PDF` driver tests write a proof to `target/print-proof-native.pdf` without using a physical printer.
 - **`columns`:** task table definitions. Each column defines how to display, edit and commit its value. Tables: Entry, Schedule, Tracking, Work, Cost, Estimates, Variance, Summary.
 - **`dialogs/*`:** Task, Resource and Project Information, Change Working Time, Assign Resources, External Links, Statistics, History, About, and the MCP panel.
 - **`mcp_host`:** starts and stops the HTTP MCP server on the app's `SharedWorkspace`, and repaints the window when agents make changes.
-- **`theme`:** light and dark palettes; all drawing reads colors from `theme::pal()`, and the Theme setting (System/Light/Dark) switches between them.
+- **`theme`:** light and dark palettes; all drawing reads colors from `theme::pal()`, and the Theme setting (System/Light/Dark/Gray/Black) switches between them.
 - **`logo`:** the mark as geometry, painted with egui and rasterized for the window icon.
 
 The UI locks the workspace once per frame. Views either edit the active `Document` directly or emit `Command`s that the app executes after layout.

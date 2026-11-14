@@ -39,6 +39,10 @@ pub const MAX_NOTES_CHARS: usize = 100_000;
 pub const MAX_MINUTES: Minutes = 5 * 366 * 24 * 60;
 /// Largest percentage lag (either sign).
 pub const MAX_LAG_PERCENT: i32 = 10_000;
+/// Largest work or duration a summary or baseline can total: every task at the maximum.
+pub const MAX_TOTAL_MINUTES: Minutes = MAX_MINUTES * MAX_TASKS as Minutes;
+/// Largest cost a summary or baseline can total.
+pub const MAX_TOTAL_MONEY: f64 = MAX_MONEY * MAX_TASKS as f64;
 /// Largest units of a resource or assignment (100,000%).
 pub const MAX_UNITS: f64 = 1_000.0;
 /// Largest rate, cost per use or cost (either sign for costs).
@@ -87,11 +91,15 @@ pub fn check_counts(p: &Project) -> PlanResult<()> {
     too_many("time entries", p.time_entries.len(), MAX_TIME_ENTRIES)?;
     too_many("calendars", p.calendars.len(), MAX_CALENDARS)?;
     too_many("linked projects", p.external_projects.len(), MAX_EXTERNAL_PROJECTS)?;
+    too_many("custom fields", p.custom_fields.len(), crate::custom::MAX_CUSTOM_FIELDS)?;
+    too_many("saved tables", p.tables.len(), crate::custom::MAX_TABLES)?;
     unique("task", p.tasks.iter().map(|t| t.id.0))?;
     unique("resource", p.resources.iter().map(|r| r.id.0))?;
     unique("assignment", p.assignments.iter().map(|a| a.id.0))?;
     unique("time entry", p.time_entries.iter().map(|e| e.id.0))?;
     unique("calendar", p.calendars.iter().map(|c| c.id.0))?;
+    unique("custom field", p.custom_fields.iter().map(|f| f.id.0))?;
+    unique("board column", p.board_columns.iter().map(|c| c.id.0))?;
     Ok(())
 }
 
@@ -148,6 +156,11 @@ pub fn sanitize(p: &mut Project) -> Vec<String> {
     for t in &mut p.tasks {
         s.task(t, &calendars);
     }
+    s.custom_fields(p);
+    s.board(p);
+    if p.page_setup.sanitize() {
+        s.note("page setup values were out of range");
+    }
     for r in &mut p.resources {
         s.resource(r, &calendars);
     }
@@ -193,7 +206,15 @@ pub fn sanitize(p: &mut Project) -> Vec<String> {
     }
 
     let ids = &mut p.ids;
-    for counter in [&mut ids.task, &mut ids.resource, &mut ids.calendar, &mut ids.assignment, &mut ids.time_entry] {
+    for counter in [
+        &mut ids.task,
+        &mut ids.resource,
+        &mut ids.calendar,
+        &mut ids.assignment,
+        &mut ids.time_entry,
+        &mut ids.custom_field,
+        &mut ids.board_column,
+    ] {
         if *counter > MAX_ID {
             *counter = MAX_ID;
             s.note("an id counter is out of range");
@@ -210,6 +231,97 @@ struct Fixer {
 }
 
 impl Fixer {
+    /// Custom field definitions, task values (dropped when their field is gone or of another
+    /// kind) and saved table layouts.
+    fn board(&mut self, p: &mut Project) {
+        self.list(&mut p.board_columns, crate::board::MAX_BOARD_COLUMNS, "the board has more than 100 columns");
+        let mut names = HashSet::new();
+        for c in &mut p.board_columns {
+            self.name(&mut c.name);
+            if c.name.trim().is_empty() || !names.insert(crate::board::name_key(&c.name)) {
+                let mut n = 1u32;
+                let mut name = format!("Column {}", c.id.0);
+                while !names.insert(crate::board::name_key(&name)) {
+                    n = n.saturating_add(1);
+                    name = format!("Column {} ({n})", c.id.0);
+                }
+                c.name = name;
+                self.note("a board column name was empty or repeated");
+            }
+            if c.percent_complete.is_some_and(|v| v > 100) {
+                c.percent_complete = Some(100);
+                self.note("a board column's % complete is above 100");
+            }
+        }
+        let columns: HashSet<_> = p.board_columns.iter().map(|c| c.id).collect();
+        for t in &mut p.tasks {
+            if t.board_status.is_some_and(|s| !columns.contains(&s)) {
+                t.board_status = None;
+                self.note("a task was in a board column that does not exist");
+            }
+        }
+    }
+
+    fn custom_fields(&mut self, p: &mut Project) {
+        use crate::custom::{self, CustomFieldKind, CustomValue};
+        let mut names = HashSet::new();
+        for f in &mut p.custom_fields {
+            self.name(&mut f.name);
+            if f.name.trim().is_empty() || !names.insert(f.name.to_lowercase()) {
+                // A fresh name that no earlier field uses (a later field named the same is
+                // renamed in turn when its own turn comes).
+                let mut n = 1u32;
+                let mut name = format!("Field {}", f.id.0);
+                while !names.insert(name.to_lowercase()) {
+                    n = n.saturating_add(1);
+                    name = format!("Field {} ({n})", f.id.0);
+                }
+                f.name = name;
+                self.note("a custom field name was empty or repeated");
+            }
+            self.list(&mut f.choices, custom::MAX_CHOICES, "a pick-list has too many entries");
+            for c in &mut f.choices {
+                self.name(c);
+            }
+            if !f.choices.is_empty() && f.kind != CustomFieldKind::Text {
+                f.choices.clear();
+                self.note("a pick-list was set on a field that is not text");
+            }
+        }
+        let kinds: std::collections::HashMap<_, _> = p.custom_fields.iter().map(|f| (f.id, f.kind)).collect();
+        for t in &mut p.tasks {
+            let before = t.custom.len();
+            t.custom.retain(|id, v| kinds.get(id).is_some_and(|k| v.fits(*k)));
+            if t.custom.len() != before {
+                self.note("a custom value belonged to a missing field or had the wrong type");
+            }
+            for v in t.custom.values_mut() {
+                match v {
+                    CustomValue::Text(s) => self.name(s),
+                    CustomValue::Number(n) => {
+                        self.f64(n, -custom::MAX_CUSTOM_NUMBER, custom::MAX_CUSTOM_NUMBER, "a custom number is out of range")
+                    }
+                    CustomValue::Date(d) => self.datetime(d),
+                    CustomValue::Duration(m) => self.minutes(m, "a custom duration is out of range"),
+                    CustomValue::Flag(_) => {}
+                }
+            }
+        }
+        for table in &mut p.tables {
+            self.name(&mut table.name);
+            self.list(&mut table.columns, custom::MAX_TABLE_COLUMNS, "a table has too many columns");
+            let before = table.columns.len();
+            table.columns.retain(|c| {
+                !c.is_empty()
+                    && c.chars().count() <= custom::MAX_COLUMN_KEY_CHARS
+                    && custom::custom_column_field(c).is_none_or(|id| kinds.contains_key(&id))
+            });
+            if table.columns.len() != before {
+                self.note("a table column was invalid or showed a missing custom field");
+            }
+        }
+    }
+
     fn note(&mut self, what: &'static str) {
         *self.notes.entry(what).or_default() += 1;
     }
@@ -288,6 +400,22 @@ impl Fixer {
         }
     }
 
+    fn total_minutes(&mut self, m: &mut Minutes, what: &'static str) {
+        let c = (*m).clamp(0, MAX_TOTAL_MINUTES);
+        if c != *m {
+            *m = c;
+            self.note(what);
+        }
+    }
+
+    /// Swaps a start that comes after its finish.
+    fn ordered(&mut self, start: &mut NaiveDateTime, finish: &mut NaiveDateTime) {
+        if start > finish {
+            std::mem::swap(start, finish);
+            self.note("a baseline or interim plan starts after it finishes");
+        }
+    }
+
     fn signed_minutes(&mut self, m: &mut Minutes, what: &'static str) {
         let c = (*m).clamp(-MAX_MINUTES, MAX_MINUTES);
         if c != *m {
@@ -363,6 +491,10 @@ impl Fixer {
         self.name(&mut s.currency);
         self.minutes(&mut s.minutes_per_point, "work per complexity point is out of range");
         self.signed_minutes(&mut s.critical_slack, "the critical slack threshold is out of range");
+        if s.earned_value_baseline > crate::baseline::MAX_BASELINE {
+            s.earned_value_baseline = 0;
+            self.note("the earned value baseline does not exist");
+        }
     }
 
     fn task(&mut self, t: &mut Task, calendars: &HashSet<crate::ids::CalendarId>) {
@@ -385,6 +517,27 @@ impl Fixer {
         self.opt_datetime(&mut t.actual_finish);
         self.opt_datetime(&mut t.manual_start);
         self.opt_datetime(&mut t.manual_finish);
+        self.list(&mut t.splits, crate::schedule::MAX_SPLITS, "a task has more than 100 pauses");
+        self.list(&mut t.gaps, crate::schedule::MAX_SPLITS, "a task has more than 100 splits");
+        for g in &mut t.gaps {
+            self.minutes(&mut g.work, "a task's split is out of range");
+            self.minutes(&mut g.length, "a task's split is out of range");
+        }
+        if let Some(r) = &mut t.recurrence_pattern {
+            if r.calendar.is_some_and(|c| !calendars.contains(&c)) {
+                r.calendar = None;
+                self.note("a recurring task used a calendar that does not exist");
+            }
+            if r.validate().is_err() {
+                // Its occurrences stay, as ordinary subtasks.
+                t.recurrence_pattern = None;
+                self.note("a recurring task's pattern was not valid");
+            }
+        }
+        for sp in &mut t.splits {
+            self.minutes(&mut sp.work, "a task's pause is out of range");
+            self.datetime(&mut sp.resume);
+        }
         if t.calendar.is_some_and(|c| !calendars.contains(&c)) {
             t.calendar = None;
             self.note("a task used a calendar that does not exist");
@@ -413,13 +566,26 @@ impl Fixer {
             }
         }
         self.f64(&mut t.fixed_cost, -MAX_MONEY, MAX_MONEY, "a cost is out of range");
-        if let Some(b) = &mut t.baseline {
+        let before = (t.baselines.len(), t.interim.len());
+        t.baselines.retain(|n, _| (1..=crate::baseline::MAX_BASELINE).contains(n));
+        t.interim.retain(|n, _| (1..=crate::baseline::MAX_INTERIM).contains(n));
+        if before != (t.baselines.len(), t.interim.len()) {
+            self.note("a baseline or interim plan number is out of range");
+        }
+        // A summary's baseline totals its subtasks, so it gets the summary-sized limits.
+        for b in t.baseline.iter_mut().chain(t.baselines.values_mut()) {
             self.datetime(&mut b.start);
             self.datetime(&mut b.finish);
             self.datetime(&mut b.saved);
-            self.minutes(&mut b.duration, "a baseline duration is out of range");
-            self.minutes(&mut b.work, "baseline work is out of range");
-            self.f64(&mut b.cost, -MAX_MONEY, MAX_MONEY, "a cost is out of range");
+            self.ordered(&mut b.start, &mut b.finish);
+            self.total_minutes(&mut b.duration, "a baseline duration is out of range");
+            self.total_minutes(&mut b.work, "baseline work is out of range");
+            self.f64(&mut b.cost, -MAX_TOTAL_MONEY, MAX_TOTAL_MONEY, "a baseline cost is out of range");
+        }
+        for i in t.interim.values_mut() {
+            self.datetime(&mut i.start);
+            self.datetime(&mut i.finish);
+            self.ordered(&mut i.start, &mut i.finish);
         }
     }
 

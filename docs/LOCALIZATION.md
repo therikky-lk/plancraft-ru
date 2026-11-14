@@ -48,3 +48,18 @@ The settings tests in plancraft-app check persistence.
 
 Translation catalogs contain display strings only. Scheduling, file schema,
 MCP tool names and document operations remain independent of catalog files.
+
+## Upstream v0.4.1 integration
+
+The integration adds Japanese UI copy for the new views and print controls.
+Existing translations in the other locales remain intact; newly added keys
+without a translation currently contain their English fallback. Equal key
+counts and passing placeholder checks do not mean those new entries have been
+translated. Review and translate those English entries before describing the
+new features as fully localized in every supported language.
+
+Saved task-table layout names use stable English keys independently of the
+translated table caption, so changing the interface language keeps the same
+custom columns. User-defined field names, choice values and board-column names
+are project data. Default board columns use the language at project creation;
+switching the language does not rename an existing project's columns.

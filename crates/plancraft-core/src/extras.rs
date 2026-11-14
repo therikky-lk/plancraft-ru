@@ -196,20 +196,23 @@ pub fn task_earned_value(p: &Project, ti: usize) -> Option<TaskEarnedValue> {
     let at = status_moment(p);
     let t = p.tasks.get(ti)?;
     let leaves: Vec<usize> = if t.sched.is_summary { p.descendants_range(ti).collect() } else { vec![ti] };
-    let mut ev = TaskEarnedValue::default();
+    let mut ev = TaskEarnedValue { baseline: p.settings.earned_value_baseline, ..Default::default() };
     let mut any = false;
     for li in leaves {
         let Some(l) = p.tasks.get(li) else { continue };
         if l.sched.is_summary || !l.active {
             continue;
         }
-        let Some(b) = l.baseline else { continue };
+        let Some(b) = l.baseline_in(p.settings.earned_value_baseline) else { continue };
         any = true;
         ev.bac += b.cost;
         ev.bcws += b.cost * fraction(p, b.start, b.finish, at);
         ev.bcwp += b.cost * l.sched.percent_complete as f64 / 100.0;
-        let actual_ratio =
-            if l.sched.work > 0 { l.sched.actual_work as f64 / l.sched.work as f64 } else { l.sched.percent_complete as f64 / 100.0 };
+        let actual_ratio = if l.sched.work > 0 && l.sched.actual_work > 0 {
+            l.sched.actual_work as f64 / l.sched.work as f64
+        } else {
+            l.sched.percent_complete as f64 / 100.0
+        };
         ev.acwp += l.sched.cost * actual_ratio;
     }
     if !any {
@@ -227,6 +230,7 @@ pub fn task_earned_value(p: &Project, ti: usize) -> Option<TaskEarnedValue> {
 /// Earned-value fields shown in the "Earned Value" table.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct TaskEarnedValue {
+    pub baseline: u8,
     pub bcws: f64,
     pub bcwp: f64,
     pub acwp: f64,
@@ -244,7 +248,7 @@ pub struct TaskEarnedValue {
 
 impl From<TaskEarnedValue> for EarnedValue {
     fn from(v: TaskEarnedValue) -> Self {
-        EarnedValue { bcws: v.bcws, bcwp: v.bcwp, acwp: v.acwp, sv: v.sv, cv: v.cv, spi: v.spi, cpi: v.cpi }
+        EarnedValue { bcws: v.bcws, bcwp: v.bcwp, acwp: v.acwp, sv: v.sv, cv: v.cv, spi: v.spi, cpi: v.cpi, baseline: v.baseline }
     }
 }
 
@@ -683,6 +687,9 @@ pub fn reschedule_uncompleted_after(p: &mut Project, after: NaiveDateTime, only:
 /// Where a split task stops and resumes (`None` if it is not split).
 pub fn split_points(p: &Project, i: usize) -> Option<(NaiveDateTime, NaiveDateTime)> {
     let t = p.tasks.get(i)?;
+    if t.sched.parts.len() > 1 {
+        return t.sched.stop.zip(t.sched.resume);
+    }
     let r = t.resume?;
     if t.is_complete() || t.actual_finish.is_some() {
         return None;

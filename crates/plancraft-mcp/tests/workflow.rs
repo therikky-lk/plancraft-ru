@@ -238,6 +238,42 @@ fn full_project_workflow() {
     let fe_var = var["tasks"].as_array().unwrap().iter().find(|t| t["id"] == fe).unwrap();
     assert_eq!(fe_var["finish_variance_minutes"], 480);
     assert_eq!(fe_var["finish_variance"], "1 day");
+    // Baseline1 keeps the new plan; variance still measures against Baseline.
+    let b1 = c.call("set_baseline", json!({ "baseline": "baseline1" }));
+    assert_eq!((b1["name"].as_str(), b1["tasks"].as_u64()), (Some("Baseline1"), Some(8)));
+    assert!(b1["saved"].is_string());
+    let var1 = c.call("get_variance", json!({ "baseline": 1, "tasks": [fe] }));
+    assert_eq!((var1["baseline"].as_str(), var1["tasks"][0]["finish_variance_minutes"].as_i64()), (Some("Baseline1"), Some(0)));
+    let var0 = c.call("get_variance", json!({ "tasks": [fe] }));
+    assert_eq!(var0["tasks"][0]["finish_variance_minutes"], 480);
+    let fe_task = c.call("get_task", json!({ "task": fe }));
+    assert!(fe_task["other_baselines"]["baseline1"]["finish"].is_string(), "{fe_task}");
+    assert_eq!(fe_task["baseline"]["finish_variance_minutes"], 480);
+    let interim = c.call("set_interim_plan", json!({ "copy": "baseline", "into": "interim2", "tasks": [fe] }));
+    assert_eq!((interim["tasks"].as_u64(), interim["tasks_written"].as_u64()), (Some(1), Some(1)));
+    assert_eq!(c.call("get_task", json!({ "task": fe }))["interim_plans"]["interim2"]["finish"], fe_var["baseline_finish"]);
+    c.call_err("set_interim_plan", json!({ "copy": "interim2", "into": "baseline3" }));
+    c.call_err("set_interim_plan", json!({ "copy": "baseline", "into": "scheduled" }));
+    c.call_err("set_baseline", json!({ "baseline": 11 }));
+    c.call_err("clear_baseline", json!({ "baseline": 1, "interim_plan": 2 }));
+    let listed = c.call("list_baselines", json!({}));
+    assert_eq!(listed["baselines"].as_array().unwrap().len(), 11);
+    assert_eq!(listed["baselines"][1]["tasks"], 8);
+    assert_eq!(listed["baselines"][2]["tasks"], 0);
+    assert_eq!(listed["interim_plans"].as_array().unwrap().len(), 1);
+    // Review fixes: an empty task list never means "everything"; copying an empty plan is
+    // refused rather than erasing the target; names and null work like everywhere else.
+    c.call_err("set_interim_plan", json!({ "copy": "scheduled", "into": "interim3", "tasks": [] }));
+    c.call_err("clear_baseline", json!({ "tasks": [] }));
+    c.call_err("set_interim_plan", json!({ "copy": "baseline7", "into": "baseline" }));
+    assert_eq!(c.call("list_baselines", json!({}))["baselines"][0]["tasks"], 8, "Baseline is untouched");
+    assert_eq!(c.call("clear_baseline", json!({ "baseline": null, "interim_plan": "interim2" }))["tasks_cleared"], 1);
+    let ev = c.call("update_project", json!({ "earned_value_baseline": "baseline1" }));
+    assert_eq!(ev["settings"]["earned_value_baseline"], "Baseline1", "{ev}");
+    assert_eq!(c.call("project_statistics", json!({}))["earned_value"]["baseline"], "Baseline1");
+    c.call_err("update_project", json!({ "earned_value_baseline": 11 }));
+    c.call("update_project", json!({ "earned_value_baseline": 0 }));
+    assert_eq!(c.call("clear_baseline", json!({ "baseline": "baseline1" }))["tasks_cleared"], 8);
     let stats = c.call("project_statistics", json!({}));
     assert_eq!(stats["milestones"], 1);
     assert_eq!(stats["summary_tasks"], 2);
@@ -433,4 +469,410 @@ fn workspace_from_files_handles_new_and_existing() {
     assert!(!ws2.lock().unwrap().docs[0].dirty);
     assert!(plancraft_mcp::workspace_from_files(&[dir.path().join("missing-dir/x.plancraft")]).is_err());
     assert!(plancraft_mcp::workspace_from_files::<&str>(&[]).unwrap().lock().unwrap().docs.is_empty());
+}
+
+/// Regression: `close_project` with `discard_changes` closed a document holding the user's
+/// unsaved edits from the app, and the app then pruned its recovery copy, so the work was gone.
+#[test]
+fn agents_cannot_discard_the_users_unsaved_work() {
+    use plancraft_core::workspace::ChangeSource;
+    let c = Client::new();
+    c.call("new_project", json!({ "name": "Shared", "start": "2026-10-19" }));
+    c.call("create_task", json!({ "name": "Agent task" }));
+    // The user edits the same document in the app.
+    {
+        let mut ws = c.server.workspace().lock().unwrap();
+        let doc = ws.active_doc_mut().unwrap();
+        doc.edit_as("Add task", ChangeSource::User, |p| p.add_task("User task", None)).unwrap();
+    }
+    let e = c.call_err("close_project", json!({ "discard_changes": true }));
+    assert!(e.contains("made by the user"), "{e}");
+    assert_eq!(c.call("list_tasks", json!({}))["total"], 2, "the document is still open");
+
+    // Undo through MCP is the agent's change, not the user's.
+    c.call("new_project", json!({ "name": "Agent only", "start": "2026-10-19" }));
+    c.call("create_task", json!({ "name": "Draft" }));
+    c.call("undo", json!({}));
+    {
+        let ws = c.server.workspace().lock().unwrap();
+        let doc = ws.active_doc().unwrap();
+        assert_eq!(doc.last_change.as_ref().map(|(_, s)| *s), Some(ChangeSource::Agent));
+        assert!(!doc.user_changes);
+    }
+    // An agent may still throw away its own unsaved work.
+    c.call("close_project", json!({ "discard_changes": true }));
+    assert_eq!(c.call("get_project", json!({}))["project"]["name"], "Shared");
+}
+
+/// Regression: saving overwrote a file another program (a second PlanCraft, a standalone MCP
+/// server, a sync tool) had changed since it was opened, silently losing that program's work.
+#[test]
+fn saving_never_silently_overwrites_another_programs_changes() {
+    let dir = std::env::temp_dir().join(format!("plancraft-conflict-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("plan.plancraft");
+    let c = Client::new();
+    c.call("new_project", json!({ "name": "Plan", "start": "2026-10-19" }));
+    c.call("save_project", json!({ "path": path.to_str().unwrap() }));
+
+    // Another program rewrites the file (different size, so the change is visible at once).
+    let mut other = plancraft_core::io::load(&path).unwrap();
+    other.add_task("Written elsewhere", None);
+    plancraft_core::io::save(&other, &path).unwrap();
+
+    c.call("create_task", json!({ "name": "Mine" }));
+    let e = c.call_err("save_project", json!({}));
+    assert!(e.contains("changed by another program") && e.contains("overwrite"), "{e}");
+    // Regression: naming the document's own file as 'path' went through Save As, which skipped
+    // the check.
+    let e = c.call_err("save_project", json!({ "path": path.to_str().unwrap() }));
+    assert!(e.contains("changed by another program"), "{e}");
+    assert!(plancraft_core::io::load(&path).unwrap().tasks.iter().any(|t| t.name == "Written elsewhere"), "the other version is intact");
+    // Save As onto another existing file needs overwrite too.
+    let other_file = dir.join("other.plancraft");
+    std::fs::write(&other_file, "keep me").unwrap();
+    let e = c.call_err("save_project", json!({ "path": other_file.to_str().unwrap() }));
+    assert!(e.contains("already exists"), "{e}");
+    assert_eq!(std::fs::read_to_string(&other_file).unwrap(), "keep me");
+
+    c.call("save_project", json!({ "overwrite": true }));
+    let saved = plancraft_core::io::load(&path).unwrap();
+    assert!(saved.tasks.iter().any(|t| t.name == "Mine"));
+    // Once saved, ordinary saves work again.
+    c.call("create_task", json!({ "name": "More" }));
+    c.call("save_project", json!({}));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn custom_fields_are_defined_set_and_shown() {
+    let c = Client::new();
+    c.call("new_project", json!({ "name": "Custom", "start": "2026-10-19" }));
+    let t = c.call("create_task", json!({ "name": "Design" }));
+    let id = t["id"].as_u64().unwrap();
+    c.call("create_custom_field", json!({ "name": "Status", "choices": ["To do", "Doing", "Done"] }));
+    c.call("create_custom_field", json!({ "name": "Budget", "type": "cost" }));
+    c.call("create_custom_field", json!({ "name": "Approved", "type": "flag" }));
+
+    let task = c.call("update_task", json!({ "task": id, "custom": { "status": "doing", "Budget": 1250.5, "Approved": true } }));
+    assert_eq!(task["custom"]["Status"], "Doing", "{task}");
+    assert_eq!(task["custom"]["Budget"], "$1250.50");
+    assert_eq!(task["custom"]["Approved"], "Yes");
+    let e = c.call_err("update_task", json!({ "task": id, "custom": { "Status": "Blocked" } }));
+    assert!(e.contains("not one of the choices"), "{e}");
+    let e = c.call_err("update_task", json!({ "task": id, "custom": { "Colour": "red" } }));
+    assert!(e.contains("Status") && e.contains("Budget"), "lists the fields: {e}");
+
+    let list = c.call("list_tasks", json!({}));
+    assert_eq!(list["tasks"][0]["custom"]["Status"], "Doing");
+    let fields = c.call("list_custom_fields", json!({}));
+    assert_eq!(fields["custom_fields"][0]["tasks_with_value"], 1);
+
+    c.call("update_custom_field", json!({ "field": "Status", "name": "Stage", "choices": ["Doing", "Done"] }));
+    c.call("update_task", json!({ "task": id, "custom": { "Stage": null } }));
+    assert!(c.call("get_task", json!({ "task": id }))["custom"].get("Stage").is_none());
+    let left = c.call("delete_custom_field", json!({ "field": "Budget" }));
+    assert_eq!(left["custom_fields"].as_array().unwrap().len(), 2);
+    // Undo restores the deleted field and its value.
+    c.call("undo", json!({}));
+    assert_eq!(c.call("get_task", json!({ "task": id }))["custom"]["Budget"], "$1250.50");
+}
+
+#[test]
+fn agents_set_page_setup_and_export_pdfs() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Client::new();
+    c.call("new_project", json!({ "name": "Print me", "start": "2026-10-19" }));
+    let a = c.call("create_task", json!({ "name": "Design", "duration": "5d" }));
+    let b = c.call("create_task", json!({ "name": "Build", "duration": "10d", "predecessors": [a["id"]] }));
+    assert!(b["id"].is_u64());
+
+    let s = c.call("set_page_setup", json!({ "paper": "a4", "orientation": "portrait", "header": ["", "[Project] plan", ""] }));
+    assert_eq!(s["page_setup"]["paper"], "A4", "{s}");
+    assert_eq!(s["page_setup"]["orientation"], "Portrait");
+    assert_eq!(s["page_setup"]["header"][1], "[Project] plan");
+    let e = c.call_err("set_page_setup", json!({ "paper": "napkin" }));
+    assert!(e.contains("letter"), "{e}");
+    // Page Setup is an undoable edit.
+    c.call("undo", json!({}));
+    let back = c.call("set_page_setup", json!({}));
+    assert_eq!(back["page_setup"]["paper"], "Letter", "undo put the old setup back: {back}");
+    assert!(c.call_err("set_page_setup", json!({ "scale_percent": 5 })).contains("at least"));
+
+    let path = dir.path().join("plan");
+    let out = c.call("export_pdf", json!({ "path": path.to_str().unwrap(), "pages_wide": 2 }));
+    assert_eq!(out["pages"], 2, "{out}");
+    let pdf = dir.path().join("plan.pdf");
+    let bytes = std::fs::read(&pdf).unwrap();
+    assert!(bytes.starts_with(b"%PDF-1.7"));
+    // Never silently replaces a file, never writes anything but a PDF.
+    let e = c.call_err("export_pdf", json!({ "path": pdf.to_str().unwrap() }));
+    assert!(e.contains("overwrite"), "{e}");
+    c.call("export_pdf", json!({ "path": pdf.to_str().unwrap(), "overwrite": true, "view": "table" }));
+    let e = c.call_err("export_pdf", json!({ "path": dir.path().join("plan.plancraft").to_str().unwrap() }));
+    assert!(e.contains(".pdf"), "{e}");
+    let e = c.call_err("export_pdf", json!({ "path": pdf.to_str().unwrap(), "overwrite": true, "from": "2026-12-01", "to": "2026-11-01" }));
+    assert!(e.contains("before"), "{e}");
+    // Dates outside 1900-2300 are refused, like everywhere else.
+    let e = c.call_err("export_pdf", json!({ "path": pdf.to_str().unwrap(), "overwrite": true, "from": "0001-01-01" }));
+    assert!(e.contains("between"), "{e}");
+    // The Network Diagram and the Task Board print as drawings.
+    for view in ["network", "board"] {
+        let out = c.call("export_pdf", json!({ "path": pdf.to_str().unwrap(), "overwrite": true, "view": view, "pages_wide": 1 }));
+        assert!(out["pages"].as_u64().unwrap() >= 1, "{out}");
+        assert!(std::fs::read(&pdf).unwrap().starts_with(b"%PDF-1.7"));
+    }
+    let e = c.call_err("export_pdf", json!({ "path": pdf.to_str().unwrap(), "overwrite": true, "view": "calendar" }));
+    assert!(e.contains("network") && e.contains("board"), "{e}");
+}
+
+#[test]
+fn agents_update_progress_and_reschedule_uncompleted_work() {
+    let c = Client::new();
+    c.call("new_project", json!({ "name": "Track me", "start": "2026-10-19" }));
+    let a = c.call("create_task", json!({ "name": "Design", "duration": "2d" }));
+    let b = c.call("create_task", json!({ "name": "Build", "duration": "4d", "predecessors": [a["id"]] }));
+    let free = c.call("create_task", json!({ "name": "Docs", "duration": "1d" }));
+
+    // Progress through Wednesday, as scheduled: Design done, Build a quarter done.
+    c.call("update_project", json!({ "status_date": "2026-10-21" }));
+    let r = c.call("update_progress_through", json!({}));
+    assert_eq!(r["through"], "2026-10-21", "{r}");
+    assert_eq!(r["updated"].as_array().unwrap().len(), 3, "{r}");
+    let build = c.call("get_task", json!({ "task": b["id"] }));
+    assert_eq!(build["percent_complete_entered"], 25, "{build}");
+    assert_eq!(build["stop"], "2026-10-21 17:00", "{build}");
+
+    // Work not done by Monday moves after it; actual dates stay.
+    let r = c.call("reschedule_uncompleted_work", json!({ "date": "2026-10-26" }));
+    assert_eq!(r["split"][0]["id"], b["id"], "{r}");
+    assert!(r["constrained"].as_array().unwrap().is_empty(), "Docs is already complete: {r}");
+    let build = c.call("get_task", json!({ "task": b["id"] }));
+    assert_eq!(build["resume"], "2026-10-27 08:00", "{build}");
+    assert_eq!(build["start"], "2026-10-21 08:00", "{build}");
+    assert_eq!(build["finish"], "2026-10-29 17:00", "{build}");
+    assert_eq!(build["parts"], json!([["2026-10-21 08:00", "2026-10-21 17:00"], ["2026-10-27 08:00", "2026-10-29 17:00"]]), "{build}");
+    // A resume date before the stop is refused.
+    let e = c.call_err("update_task", json!({ "task": b["id"], "resume": "2026-10-20" }));
+    assert!(e.contains("after Stop"), "{e}");
+
+    // Progress as remaining duration, and the resume date set directly.
+    let t = c.call("update_task", json!({ "task": b["id"], "remaining_duration": "1d", "resume": null }));
+    assert_eq!(t["duration"], "2 days", "1 day done + 1 day left: {t}");
+    assert_eq!(t["percent_complete_entered"], 50, "{t}");
+    let e = c.call_err("update_task", json!({ "task": free["id"], "resume": "2026-11-02" }));
+    assert!(e.contains("1-99%"), "{e}");
+
+    // 0%-or-100% never lowers progress; Mark on Track needs tasks.
+    let r = c.call("update_progress_through", json!({ "date": "2026-10-19", "mode": "zero_or_hundred" }));
+    assert!(r["updated"].as_array().unwrap().is_empty(), "{r}");
+    assert!(c.call_err("update_progress_through", json!({ "mode": "sometimes" })).contains("scheduled"));
+    assert!(c.call_err("mark_on_track", json!({ "tasks": [] })).contains("at least one"));
+    c.call("mark_on_track", json!({ "tasks": [b["id"]] }));
+    // Each update is one undoable edit.
+    c.call("undo", json!({}));
+}
+
+#[test]
+fn agents_split_tasks_and_create_recurring_tasks() {
+    let c = Client::new();
+    c.call("new_project", json!({ "name": "Rhythm", "start": "2026-10-19" }));
+    let a = c.call("create_task", json!({ "name": "Build", "duration": "4d" }));
+    let id = a["id"].clone();
+
+    // Split Task: stop after Tuesday, go on next Monday; the duration stays 4 days.
+    let s = c.call("split_task", json!({ "task": id, "start": "2026-10-20", "resume": "2026-10-26" }));
+    assert_eq!(s["parts"].as_array().unwrap().len(), 2, "{s}");
+    assert_eq!(s["parts"][1]["start"], "2026-10-26 08:00");
+    assert_eq!(s["finish"], "2026-10-27 17:00");
+    assert_eq!(s["splits"][0]["length"], "3 days");
+    assert_eq!(c.call("get_task", json!({ "task": id }))["planned_splits"][0]["after_work"], "2 days");
+    let s = c.call("set_split", json!({ "task": id, "split": 1, "length": "1d" }));
+    assert_eq!(s["finish"], "2026-10-23 17:00", "{s}");
+    let s = c.call("set_split", json!({ "task": id, "part": 2, "duration": "3d" }));
+    assert_eq!((s["duration"].as_str(), s["finish"].as_str()), (Some("5 days"), Some("2026-10-26 17:00")), "{s}");
+    c.call_err("set_split", json!({ "task": id, "split": 0, "length": "1d" }));
+    c.call_err("set_split", json!({ "task": id, "split": 4, "length": "1d" }));
+    c.call_err("split_task", json!({ "task": id, "start": "2026-10-21", "resume": "2026-10-20" }));
+    let s = c.call("remove_splits", json!({ "task": id }));
+    assert_eq!((s["removed"].as_u64(), s["parts"].as_array().map(Vec::len)), (Some(1), Some(0)), "{s}");
+
+    // A weekly stand-up on Tuesdays and Thursdays, four times.
+    let r = c.call(
+        "create_recurring_task",
+        json!({ "name": "Stand-up", "pattern": "weekly", "days": ["tuesday", "thu"], "occurrences": 4, "duration": "1h", "start": "2026-10-19" }),
+    );
+    let occ = r["occurrences"].as_array().unwrap();
+    assert_eq!(occ.len(), 4, "{r}");
+    assert_eq!((occ[0]["name"].as_str(), occ[0]["start"].as_str()), (Some("Stand-up 1"), Some("2026-10-20 08:00")));
+    assert_eq!(r["recurrence"]["days"], json!(["tuesday", "thursday"]));
+    let rid = r["id"].clone();
+    // Resources on the recurring task work every occurrence.
+    c.call("create_resource", json!({ "name": "Ana" }));
+    c.call("assign_resource", json!({ "task": rid, "resource": "Ana" }));
+    let first = c.call("get_task", json!({ "task": occ[0]["id"] }));
+    assert_eq!(first["occurrence_of"]["id"], rid, "{first}");
+    assert!(first["resources"].as_str().unwrap().contains("Ana"), "{first}");
+    // Changing the pattern: monthly on the last Friday, six times; new occurrences get Ana too.
+    let u =
+        c.call("update_recurring_task", json!({ "task": rid, "pattern": "monthly", "nth": "last", "weekday": "friday", "occurrences": 6 }));
+    let occ = u["occurrences"].as_array().unwrap();
+    assert_eq!(occ.len(), 6, "{u}");
+    assert_eq!(occ[0]["start"], "2026-10-30 08:00");
+    let last = c.call("get_task", json!({ "task": occ[5]["id"] }));
+    assert!(last["resources"].as_str().unwrap().contains("Ana"), "{last}");
+    assert_eq!(c.call("get_task", json!({ "task": rid }))["recurrence"]["nth"], "last");
+    // Bad patterns are refused.
+    c.call_err("create_recurring_task", json!({ "name": "X", "pattern": "hourly" }));
+    c.call_err("create_recurring_task", json!({ "name": "X", "pattern": "weekly", "days": ["funday"] }));
+    c.call_err("create_recurring_task", json!({ "name": "X", "pattern": "monthly", "day": 32 }));
+    c.call_err("create_recurring_task", json!({ "name": "X", "pattern": "daily", "occurrences": 2, "end": "2027-01-01" }));
+    c.call_err("update_recurring_task", json!({ "task": id, "pattern": "daily" }));
+    // Review fixes: arguments that don't fit the pattern are refused; switching kinds keeps the
+    // interval or the day; a recurring task asked to go inside another lands above it; occurrences
+    // with progress are never deleted.
+    c.call_err("update_recurring_task", json!({ "task": rid, "days": ["monday"] }));
+    c.call_err("create_recurring_task", json!({ "name": "X", "pattern": "yearly", "every": 2 }));
+    let u = c.call("update_recurring_task", json!({ "task": rid, "pattern": "monthly", "day": 15, "every": 3 }));
+    let y = c.call("update_recurring_task", json!({ "task": rid, "pattern": "yearly" }));
+    assert_eq!(y["recurrence"]["day"], 15, "{y}");
+    let m = c.call("update_recurring_task", json!({ "task": rid, "pattern": "monthly", "nth": "first" }));
+    assert_eq!(m["recurrence"]["nth"], "first", "{m}");
+    assert!(u["occurrences"].as_array().unwrap().len() == 6);
+    let inner = c.call(
+        "create_recurring_task",
+        json!({ "name": "Inner", "pattern": "daily", "occurrences": 2, "before": u["occurrences"][1]["id"] }),
+    );
+    let outer_row = c.call("get_task", json!({ "task": rid }))["row"].as_u64().unwrap();
+    assert_eq!(inner["row"].as_u64().unwrap() + 3, outer_row, "Inner (and its 2 occurrences) sit above: {inner}");
+    let occ = c.call("get_task", json!({ "task": rid }))["children"].clone();
+    c.call("update_task", json!({ "task": occ[5]["id"], "percent_complete": 100 }));
+    let e = c.call_err("update_recurring_task", json!({ "task": rid, "occurrences": 2 }));
+    assert!(e.contains("progress"), "{e}");
+    let ok = c.call("update_recurring_task", json!({ "task": rid, "occurrences": 6, "name": "Sync" }));
+    assert_eq!(ok["occurrences_deleted"], 0);
+    let listed = c.call("list_tasks", json!({ "search": "Sync 1" }));
+    assert_eq!(listed["tasks"][0]["recurring"], true, "{listed}");
+    // A split whose resume is far past 2300 is refused.
+    c.call_err("split_task", json!({ "task": id, "start": "2026-10-20", "resume": "9999-01-01" }));
+
+    // A recurring milestone, inserted above Build.
+    let m = c.call(
+        "create_recurring_task",
+        json!({ "name": "Report", "pattern": "yearly", "month": "december", "day": 1, "occurrences": 2, "duration": 0, "before": id }),
+    );
+    assert_eq!(m["row"], 1, "{m}");
+    assert_eq!(c.call("get_task", json!({ "task": m["occurrences"][0]["id"] }))["kind"], "milestone");
+}
+
+#[test]
+fn agents_work_the_task_board() {
+    let c = Client::new();
+    c.call("new_project", json!({ "name": "Board", "start": "2026-10-19" }));
+    let a = c.call("create_task", json!({ "name": "Write copy", "duration": "2d" }))["id"].clone();
+    let b = c.call("create_task", json!({ "name": "Design banner", "duration": "1d" }))["id"].clone();
+    let board = c.call("get_board", json!({}));
+    let names: Vec<&str> = board["columns"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Not Started", "Next up", "In progress", "Done"]);
+    assert_eq!(board["columns"][0]["count"], 2, "new tasks start in Not Started");
+    assert_eq!(board["columns"][3]["percent_complete"], 100);
+
+    // Moving a card to Done completes the task; to In progress keeps its progress.
+    let moved = c.call("move_cards", json!({ "tasks": [a], "column": "done" }));
+    assert_eq!(moved["columns"][0]["cards"][0]["percent_complete"], 100.0, "{moved}");
+    c.call("update_task", json!({ "task": b, "board_status": "In progress", "percent_complete": 30 }));
+    let t = c.call("get_task", json!({ "task": b }));
+    assert_eq!((t["board_status"].as_str(), t["percent_complete_entered"].as_u64()), (Some("In progress"), Some(30)), "{t}");
+
+    // Columns: add with a Set % Complete, rename, move, delete (cards go to the first column).
+    c.call("add_board_column", json!({ "name": "Review", "position": 4, "percent_complete": 90 }));
+    c.call("move_cards", json!({ "tasks": [b], "column": "Review" }));
+    assert_eq!(c.call("get_task", json!({ "task": b }))["percent_complete_entered"], 90);
+    let up = c.call("update_board_column", json!({ "column": "Review", "name": "QA", "position": 2, "percent_complete": null }));
+    assert_eq!(up["columns"][1]["name"], "QA", "{up}");
+    assert!(up["columns"][1]["percent_complete"].is_null());
+    let del = c.call("delete_board_column", json!({ "column": "QA" }));
+    assert_eq!(del["cards_moved_to_first_column"], 1);
+    assert_eq!(c.call("get_task", json!({ "task": b }))["board_status"], "Not Started");
+
+    // Hidden tasks have no card; errors are clear.
+    c.call("update_task", json!({ "task": b, "show_on_board": false }));
+    assert_eq!(c.call("get_board", json!({ "column": "Not Started" }))["columns"][0]["count"], 0);
+    c.call_err("move_cards", json!({ "tasks": [a], "column": "Nowhere" }));
+    c.call_err("add_board_column", json!({ "name": "done" }));
+    c.call_err("add_board_column", json!({ "name": "X", "percent_complete": 101 }));
+    c.call_err("update_board_column", json!({ "column": "Done", "position": 0 }));
+    // Review fixes. A card moved with other changes waits for the new schedule: actual dates
+    // come from it (regression: they came from the old one).
+    let t = c.call("create_task", json!({ "name": "Ship", "duration": "3d", "board_status": "Done" }));
+    let t = c.call("get_task", json!({ "task": t["id"] }));
+    assert_eq!((t["actual_start"].as_str(), t["actual_finish"].as_str()), (Some("2026-10-19 08:00"), Some("2026-10-21 17:00")), "{t}");
+    let u = c.call("create_task", json!({ "name": "Polish", "duration": "1d" }))["id"].clone();
+    let u2 = c.call("update_task", json!({ "task": u, "duration": "5d", "board_status": "Done" }));
+    assert_eq!(u2["finish"], "2026-10-23 17:00", "{u2}");
+    // An explicit percent_complete wins over the column's.
+    let w = c.call("update_task", json!({ "task": u, "board_status": "Done", "percent_complete": 30 }));
+    assert_eq!(w["percent_complete_entered"], 30, "{w}");
+    // A number is an id, text a name: a column named "3" doesn't hide column 3.
+    c.call("add_board_column", json!({ "name": "3" }));
+    let by_id = c.call("get_board", json!({ "column": 3 }));
+    assert_eq!(by_id["columns"][0]["name"], "In progress", "{by_id}");
+    assert_eq!(c.call("get_board", json!({ "column": "3" }))["columns"][0]["name"], "3");
+    c.call_err("get_board", json!({ "column": "BB3" }));
+    c.call_err("update_board_column", json!({ "column": "3" }));
+    let limited = c.call("get_board", json!({ "column": "Done", "limit": 1 }));
+    assert_eq!((limited["columns"][0]["count"].as_u64(), limited["columns"][0]["truncated"].as_bool()), (Some(3), Some(true)), "{limited}");
+    c.call("delete_board_column", json!({ "column": "3" }));
+    for col in ["Not Started", "Next up", "In progress"] {
+        c.call("delete_board_column", json!({ "column": col }));
+    }
+    c.call_err("delete_board_column", json!({ "column": "Done" }));
+}
+
+#[test]
+fn agents_export_and_import_microsoft_project_xml() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Client::new();
+    c.call("new_project", json!({ "name": "Exchange", "start": "2026-10-19" }));
+    let a = c.call("create_task", json!({ "name": "Design", "duration": "5d" }));
+    c.call("create_task", json!({ "name": "Build", "duration": "10d", "predecessors": [a["id"]] }));
+    c.call("update_task", json!({ "task": a["id"], "board_status": "In progress" }));
+
+    let out = c.call("export_mspdi", json!({ "path": dir.path().join("plan").to_str().unwrap() }));
+    assert_eq!(out["tasks"], 2, "{out}");
+    assert!(out["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("Task Board")), "{out}");
+    let xml = dir.path().join("plan.xml");
+    assert!(std::fs::read_to_string(&xml).unwrap().contains("<Name>Build</Name>"));
+    // Never silently replaces a file, never writes anything but .xml.
+    assert!(c.call_err("export_mspdi", json!({ "path": xml.to_str().unwrap() })).contains("overwrite"));
+    c.call("export_mspdi", json!({ "path": xml.to_str().unwrap(), "overwrite": true }));
+    assert!(c.call_err("export_mspdi", json!({ "path": dir.path().join("plan.pdf").to_str().unwrap() })).contains(".xml"));
+    assert!(c.call_err("export_mspdi", json!({ "path": " " })).contains("empty"));
+    // Another program's .xml file is never replaced, even with overwrite.
+    let pom = dir.path().join("pom.xml");
+    std::fs::write(&pom, "<project/>").unwrap();
+    let e = c.call_err("export_mspdi", json!({ "path": pom.to_str().unwrap(), "overwrite": true }));
+    assert!(e.contains("not a Microsoft Project XML file"), "{e}");
+    assert_eq!(std::fs::read_to_string(&pom).unwrap(), "<project/>");
+
+    // Importing opens a new unsaved document an agent may save or close.
+    let opened = c.call("open_project", json!({ "path": xml.to_str().unwrap() }));
+    assert!(opened["import_notes"].is_array(), "{opened}");
+    assert_eq!(opened["statistics"]["tasks"], 2, "{opened}");
+    let e = c.call_err("save_project", json!({}));
+    assert!(e.contains("path"), "{e}");
+    // Opening it again shows the same unsaved import; saving it as .xml is refused.
+    let again = c.call("open_project", json!({ "path": xml.to_str().unwrap() }));
+    assert_eq!(again["document"], opened["document"]);
+    let e = c.call_err("save_project", json!({ "path": xml.to_str().unwrap(), "overwrite": true }));
+    assert!(e.contains(".plancraft"), "{e}");
+    let saved = c.call("save_project", json!({ "path": dir.path().join("imported").to_str().unwrap() }));
+    assert!(saved["path"].as_str().unwrap().ends_with("imported.plancraft"), "{saved}");
+    c.call("close_project", json!({}));
+
+    // Something that is not a Project XML file is refused with a reason.
+    let bad = dir.path().join("bad.xml");
+    std::fs::write(&bad, "<html/>").unwrap();
+    let e = c.call_err("open_project", json!({ "path": bad.to_str().unwrap() }));
+    assert!(e.contains("not a Microsoft Project XML file"), "{e}");
 }

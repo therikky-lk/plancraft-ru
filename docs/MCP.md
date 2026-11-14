@@ -191,11 +191,11 @@ entity; read-only tools are annotated with `readOnlyHint`.
 | `list_documents` *(read-only)* | – | List the project documents currently open in this PlanCraft session, with their handle numbers, file paths, unsaved-change flag and which one is active. Use the handle as the 'document' argument of other tools. |
 | `new_project` | author, company, manager, **name**, notes, overwrite, path, start | Create a new empty project document and make it the active document. Optionally give a file path to save it immediately (required before it can be linked from other documents). |
 | `open_project` | **path** | Open a .plancraft project file (or activate it if it is already open) and make it the active document. |
-| `save_project` | path | Save the document to its file. With 'path', save as a new file (relative links to external projects are rewritten so they keep working). |
-| `close_project` | discard_changes | Close a document. Fails when it has unsaved changes unless discard_changes is true. |
+| `save_project` | path, overwrite | Save the document to its file. With 'path', save as a new file (relative links to external projects are rewritten so they keep working). Fails when another program changed the file since it was opened or last saved, unless overwrite is true. |
+| `close_project` | discard_changes | Close a document. Fails when it has unsaved changes unless discard_changes is true. Unsaved changes the user made in the app are never discarded. |
 | `set_active_document` | – | Make another open document the active one (the default target of all tools and the document shown in the app). |
 | `get_project` *(read-only)* | – | Get project information (name, dates, manager, file), settings (hours per day, currency, points, scheduling options), calendars and key statistics (task counts, late/critical tasks, work, cost, % complete, warnings). |
-| `update_project` | author, calendar, company, critical_slack, currency, days_per_month, default_finish_time, default_start_time, duration_unit, hours_per_day, hours_per_point, hours_per_week, manager, minutes_per_point, name, new_tasks_auto, notes, progress_from_time, start, status_date, use_resource_calendars | Update project properties and settings. Only the given fields change. |
+| `update_project` | author, calendar, company, critical_slack, currency, days_per_month, default_finish_time, default_start_time, duration_unit, earned_value_baseline, hours_per_day, hours_per_point, hours_per_week, manager, minutes_per_point, name, new_tasks_auto, notes, progress_from_time, start, status_date, use_resource_calendars | Update project properties and settings. Only the given fields change. |
 
 ### Tasks
 
@@ -203,9 +203,9 @@ entity; read-only tools are annotated with `readOnlyHint`.
 |---|---|---|
 | `list_tasks` *(read-only)* | filter, include_schedule, limit, max_level, offset, parent, search | List tasks in outline order with id, row, WBS, level, kind, duration, start/finish, % complete, critical flag, slack, work, predecessors and resources. Filter by category, search text or subtree. |
 | `get_task` *(read-only)* | **task** | Get every detail of one task: schedule (early/late dates, slack), constraint, deadline, progress and actuals, estimate, cost, predecessors and successors, assignments, milestone membership, parent/children, baseline and variance, notes and warnings. |
-| `create_task` | active, actual_finish, actual_start, after, bar_color, before, calendar, constraint_date, constraint_type, deadline, deliverable, duration, effort_driven, estimate, estimated, finish, fixed_cost, ignore_resource_calendars, index, is_milestone, manual_finish, manual_start, mode, **name**, notes, parent, percent_complete, predecessors, priority, resources, show_on_timeline, start, task_type | Create one task. Position it with parent/after/before/index (default: appended at the top level). New tasks default to an estimated 1-day duration; set 'duration', 'estimate', 'predecessors', 'resources' etc. in the same call. For many tasks use create_tasks. |
+| `create_task` | active, actual_duration, actual_finish, actual_start, after, bar_color, before, board_status, calendar, constraint_date, constraint_type, custom, deadline, deliverable, duration, effort_driven, estimate, estimated, finish, fixed_cost, ignore_resource_calendars, index, is_milestone, manual_finish, manual_start, mode, **name**, notes, parent, percent_complete, predecessors, priority, remaining_duration, resources, resume, show_on_board, show_on_timeline, start, task_type | Create one task. Position it with parent/after/before/index (default: appended at the top level). New tasks default to an estimated 1-day duration; set 'duration', 'estimate', 'predecessors', 'resources' etc. in the same call. For many tasks use create_tasks. |
 | `create_tasks` | after, before, index, parent, **tasks** | Create a whole work breakdown structure in one call (one undo step). Items nest via 'children' (or flat items with 'level'); each item accepts every create_task field. Use 'key' on items and reference them in other items' 'predecessors' (e.g. [{"task": "design", "type": "FS"}]) or milestone 'members'. Returns the created ids. |
-| `update_task` | active, actual_finish, actual_start, bar_color, calendar, constraint_date, constraint_type, deadline, deliverable, duration, effort_driven, estimate, estimated, finish, fixed_cost, ignore_resource_calendars, is_milestone, manual_finish, manual_start, mode, name, notes, percent_complete, predecessors, priority, resources, show_on_timeline, start, **task**, task_type | Change any editable field of a task; only the given fields change. 'start'/'finish' create SNET/FNET constraints for auto-scheduled tasks. Returns the updated task. |
+| `update_task` | active, actual_duration, actual_finish, actual_start, bar_color, board_status, calendar, constraint_date, constraint_type, custom, deadline, deliverable, duration, effort_driven, estimate, estimated, finish, fixed_cost, ignore_resource_calendars, is_milestone, manual_finish, manual_start, mode, name, notes, percent_complete, predecessors, priority, remaining_duration, resources, resume, show_on_board, show_on_timeline, start, **task**, task_type | Change any editable field of a task; only the given fields change. 'start'/'finish' create SNET/FNET constraints for auto-scheduled tasks. Returns the updated task. |
 | `update_tasks` | **updates** | Apply updates to several tasks in one call (one undo step). Each item is {"task": id, ...any update_task fields}. |
 | `delete_tasks` | **tasks** | Delete tasks together with their subtasks, links, assignments and time entries. |
 | `move_task` | after, before, index, parent, **task** | Move a task (with its subtasks) in the outline: before/after another task (taking that task's level), as the last child of a parent, or to a row index. |
@@ -269,6 +269,60 @@ entity; read-only tools are annotated with `readOnlyHint`.
 | `remove_calendar_exception` | calendar, index, name | Remove a calendar exception by index (from get_calendar) or by name. |
 | `delete_calendar` | **calendar** | Delete a calendar. Tasks and resources using it fall back to the project calendar. The project calendar cannot be deleted. |
 
+### Custom fields
+
+| Tool | Arguments (required in **bold**) | Description |
+|---|---|---|
+| `list_custom_fields` *(read-only)* | – | List the project's custom fields (id, name, type, pick-list choices and how many tasks have a value). Set values with update_task's 'custom' argument. |
+| `create_custom_field` | choices, **name**, type | Define a custom task field: text (optionally limited to a pick-list), number, cost, date, duration or flag (yes/no). Names are unique, ignoring case. |
+| `update_custom_field` | choices, **field**, name | Rename a custom field or replace a text field's pick-list. Values already set are kept. |
+| `delete_custom_field` *(destructive)* | **field** | Delete a custom field, its value on every task and its columns in saved tables. |
+
+Set or clear values with the `custom` argument of `create_task`/`update_task`, e.g. `{"custom": {"Status": "In progress", "Budget": 1200, "Approved": true}}`. A `null` value clears a field. Tasks show their values under `custom`.
+
+### Printing
+
+| Tool | Arguments (required in **bold**) | Description |
+|---|---|---|
+| `set_page_setup` | footer, header, legend, margin_mm, orientation, pages_wide, paper, print_blank_pages, repeat_columns, scale_percent | Change the plan's Page Setup (saved with the plan, undoable). Omitted settings keep their values. Returns the whole setup. |
+| `export_pdf` | footer, from, header, legend, margin_mm, orientation, overwrite, pages_wide, paper, **path**, print_blank_pages, repeat_columns, scale_percent, to, view | Print the plan to a PDF: the Gantt chart (`view: "gantt"`, the default), the Tracking Gantt with Baseline (`"tracking"`), the Multiple Baselines Gantt with Baseline, Baseline1 and Baseline2 bars (`"baselines"`) or the task table alone (`"table"`), paginated with the plan's Page Setup. Page Setup arguments apply to this export only. Needs file access; never replaces an existing file unless `overwrite` is true, and only writes `.pdf` files. |
+
+Header and footer texts take codes: `[Project]`, `[Manager]`, `[Company]`, `[View]`, `[Date]`, `[Page]`, `[Pages]`, `[Start]` and `[Finish]`. `pages_wide: 0` prints the timescale at a fixed zoom instead of fitting it to pages.
+
+### Progress and status date
+
+| Tool | Arguments (required in **bold**) | Description |
+|---|---|---|
+| `update_progress_through` | date, mode, tasks | Update Project's "Update work as complete through": each task's % complete becomes what its schedule says at the end of `date` (`mode: "scheduled"`, the default), or only tasks that finish by then become 100% (`"zero_or_hundred"`). Progress already entered is never lowered. `date` defaults to the status date, else today. |
+| `reschedule_uncompleted_work` | date, tasks | Update Project's "Reschedule uncompleted work to start after": work not done by the end of `date` moves after it and actual dates stay. A task in progress pauses at its stop and resumes after the date (earlier pauses stay); a task not started, and not already moved past the date by its links, gets a Start No Earlier Than constraint. Manually scheduled tasks and other constraints are left alone and listed under `skipped`. |
+| `mark_on_track` | **tasks** | Set the tasks' % complete to what their schedule says at the status date (today if none is set), never lowering progress. |
+
+Set the status date with `update_project` (`status_date`, or `null` for today). Tasks also take `actual_duration`, `remaining_duration` and `resume` in `create_task`/`update_task`. Task details show `stop` (end of the work done so far), `resume` (when the rest starts) and, for a split task, `parts` (the start and finish of each working part). Setting `resume` later than `stop` pauses the task there; a date before `stop` is refused, and `null` removes a pause still ahead. Progress fills the parts in order, so work done after a pause never lands inside it.
+
+### Task Board
+
+| Tool | Arguments (required in **bold**) | Description |
+|---|---|---|
+| `get_board` *(read-only)* | column, limit | The Task Board: its columns in order (name, id, Set % Complete, card count) with the cards in each (task id, row, name, % complete, resources, finish, milestone), at most 'limit' per column. A task's card sits in its Board Status column (the first column when it has none); summary tasks and tasks with show_on_board false have no card. Move cards with update_task (board_status) or move_cards. |
+| `move_cards` | **column**, **tasks** | Move tasks' cards to a column (sets their Board Status). A column with a Set % Complete value also sets their % complete. Summary tasks have no card and are refused. |
+| `add_board_column` | **name**, percent_complete, position | Add a column to the Task Board (to the right of the last one by default). Names are unique; a board has at most 100 columns. |
+| `update_board_column` | **column**, name, percent_complete, position | Rename a Task Board column, move it to another position, or change its Set % Complete value. Omitted settings keep their values. |
+| `delete_board_column` *(destructive)* | **column** | Delete a Task Board column; its cards move to the first remaining column (their tasks are kept). The last column can't be deleted. |
+
+Tasks take `board_status` (a column name or id; `null` puts the card back in the first column) and `show_on_board` in `create_task`/`update_task`, and task details show both. The card moves after the call's other changes are scheduled, and an explicit `percent_complete` in the same call wins over the column's. Columns are given as a name or "B3" text, or as a number (always an id). A plan starts with Not Started, Next up, In progress and Done (Done sets 100%).
+
+### Split tasks and recurring tasks
+
+| Tool | Arguments (required in **bold**) | Description |
+|---|---|---|
+| `split_task` | **resume**, **start**, **task** | Split Task: the task's work stops at 'start' and goes on at 'resume', leaving a pause. The duration (the work) is unchanged, so the finish moves later. The pause moves with the task when its dates change. Splitting inside an existing pause lengthens it; work already done can't be split. Only auto-scheduled tasks with a duration can be split. |
+| `set_split` | duration, length, part, split, **task** | Change the length of a task's split (its pause), numbered 1, 2, ... in order: the parts after it move. A length of 0 rejoins the parts on both sides. With 'part' and 'duration' instead, change the work in one part (numbered from 1); the task's duration changes by the difference. |
+| `remove_splits` | **task** | Remove every split planned in the task, so its work runs without pauses. Pauses in work already under way (from a later resume date or reschedule_uncompleted_work) stay. |
+| `create_recurring_task` | before, calendar, day, days, duration, end, every, ignore_resource_calendars, month, **name**, nth, occurrences, **pattern**, start, weekday, workdays | Create a recurring task: a summary task with one subtask per occurrence ("name 1", "name 2", ...), each starting no earlier than its date. Patterns: daily (every N days or N working days), weekly (every N weeks on given weekdays), monthly (every N months on a day, or the first..last weekday), yearly (a day or nth weekday of a month). End after a number of occurrences or by a date. An occurrence on a non-working day moves to the next working day. Resources assigned to the recurring task go to every occurrence; leveling never delays occurrences. Duration 0 makes recurring milestones. |
+| `update_recurring_task` *(destructive)* | calendar, day, days, duration, end, every, ignore_resource_calendars, month, name, nth, occurrences, pattern, start, **task**, weekday, workdays | Change a recurring task's name, pattern, range, duration or calendar; omitted settings keep their values (switching between daily, weekly and monthly keeps 'every'; between monthly and yearly, the day). Occurrences move to the new dates in order, extra ones are deleted (refused when one has progress or logged time) and new ones get the resources of the first occurrence. Occurrences with progress keep their dates. Tasks added under the recurring task by hand are left alone. |
+
+Task details show `planned_splits` (after how much work each pause comes, and its length), `recurrence` (the pattern in the words the tools take) and, for an occurrence, `occurrence_of`. Assign resources to a recurring task with `assign_resource` on the recurring task itself. Arguments that don't apply to the chosen pattern (e.g. `days` for monthly, `every` for yearly) are refused. A recurring task created `before` an occurrence goes above that occurrence's recurring task. An end date giving more than 999 occurrences is refused.
+
 ### Time tracking
 
 | Tool | Arguments (required in **bold**) | Description |
@@ -289,9 +343,13 @@ entity; read-only tools are annotated with `readOnlyHint`.
 | `level_resources` | clear_existing, max_delay_days, resources | Resolve overallocations by delaying tasks (leveling delay), visiting tasks by start, priority and slack. Started, manual and must-start/finish tasks are not moved. Undoable. |
 | `clear_leveling` | – | Remove all leveling delays. |
 | `project_statistics` *(read-only)* | – | Project statistics: dates, duration, work, cost, % complete, task counts (complete, in progress, late, critical), overallocated resources, baseline variance, milestone status and earned value (SPI/CPI, needs a baseline). |
-| `set_baseline` | tasks | Save the current start, finish, duration, work and cost as the baseline of all tasks (or the given tasks) for later variance tracking. |
-| `clear_baseline` | tasks | Remove the baseline from all tasks (or the given tasks). |
-| `get_variance` *(read-only)* | only_slipped, tasks | Compare current schedule with the baseline per task: start/finish variance (working time), duration, work and cost variance. |
+| `set_baseline` | baseline, roll_up_from_subtasks, roll_up_to_summaries, tasks | Save the current start, finish, duration, work and cost into a baseline (Baseline, or Baseline1-10) for all tasks or the given tasks. Variance is measured against Baseline; the numbered ones keep earlier snapshots (e.g. one per phase). Saving for selected tasks can roll the new values up into their summary tasks. Overwrites what the baseline held for those tasks. |
+| `set_interim_plan` *(destructive)* | **copy**, **into**, tasks | Copy plan values between the current schedule, baselines and interim plans (Start1/Finish1 .. Start10/Finish10). Copying into an interim plan copies start and finish only; copying a baseline into another baseline copies all its values; tasks with no value in the source lose theirs in the target. An interim plan can't be copied into a baseline. |
+| `clear_baseline` *(destructive)* | baseline, interim_plan, tasks | Remove a baseline (default Baseline) or an interim plan from all tasks (or the given tasks). |
+| `list_baselines` *(read-only)* | – | Every baseline (Baseline, Baseline1-10) and the interim plans that hold values: per slot the number of tasks with a value, when it was last saved, its start and finish, and its total work and cost. Also says which baseline variance and earned value use. |
+| `get_variance` *(read-only)* | baseline, only_slipped, tasks | Compare current schedule with a baseline per task (default Baseline): start/finish variance (working time), duration, work and cost variance. |
+
+Baselines are named `baseline` (or `0`) and `baseline1` … `baseline10` (or `1` … `10`); interim plans `interim1` … `interim10`. `get_task` adds `other_baselines` and `interim_plans` when a task has values there. `set_baseline`, `set_interim_plan` and `clear_baseline` cover the entire project when `tasks` is left out; an empty `tasks` list is refused. Copying from a baseline or interim plan that holds no values for the tasks is refused rather than erasing the target. Choose the baseline earned value uses with `update_project` (`earned_value_baseline`: 0–10 or a name); project settings show it.
 
 ### History
 
