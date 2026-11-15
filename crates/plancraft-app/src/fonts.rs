@@ -72,7 +72,7 @@ impl FontLoader {
                 continue;
             }
             let Some(face) = font::face(i) else { continue };
-            let data = FontData { font: Cow::Borrowed(face.data), index: face.index, tweak: Default::default() };
+            let data = FontData { font: Cow::Borrowed(face.data), index: face.index, tweak: screen_font_tweak() };
             let families = [FontFamily::Proportional, FontFamily::Monospace]
                 .into_iter()
                 .map(|family| InsertFontFamily { family, priority: FontPriority::Lowest })
@@ -195,8 +195,8 @@ pub fn install(ctx: &egui::Context, family: &str) {
         if defs.font_data.contains_key(&key) {
             continue;
         }
-        if let Some(bytes) = font_bytes(&db, family) {
-            defs.font_data.insert(key.clone(), Arc::new(egui::FontData::from_owned(bytes)));
+        if let Some(data) = font_data(&db, family) {
+            defs.font_data.insert(key.clone(), Arc::new(data));
             defs.families.entry(FontFamily::Proportional).or_default().push(key.clone());
             defs.families.entry(FontFamily::Monospace).or_default().push(key);
         }
@@ -211,15 +211,30 @@ pub fn install(ctx: &egui::Context, family: &str) {
     } else {
         family
     };
-    if let Some(bytes) = font_bytes(&db, family) {
-        defs.font_data.insert("user_selected".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+    if let Some(data) = font_data(&db, family) {
+        defs.font_data.insert("user_selected".to_owned(), Arc::new(data));
         defs.families.entry(FontFamily::Proportional).or_default().insert(0, "user_selected".to_owned());
         defs.families.entry(FontFamily::Monospace).or_default().insert(0, "user_selected".to_owned());
+    }
+    for data in defs.font_data.values_mut() {
+        Arc::make_mut(data).tweak.hinting_target = screen_font_tweak().hinting_target;
     }
     ctx.set_fonts(defs);
 }
 
-fn font_bytes(db: &fontdb::Database, family: &str) -> Option<Vec<u8>> {
+/// Use egui's standard hinting settings for screen fonts.
+fn screen_font_tweak() -> egui::epaint::text::FontTweak {
+    egui::epaint::text::FontTweak {
+        hinting_target: egui::epaint::text::HintingTarget::Smooth(egui::epaint::text::SmoothHinting {
+            light: false,
+            symmetric_rendering: true,
+            preserve_linear_metrics: true,
+        }),
+        ..Default::default()
+    }
+}
+
+fn font_data(db: &fontdb::Database, family: &str) -> Option<FontData> {
     if family.is_empty() {
         return None;
     }
@@ -229,7 +244,7 @@ fn font_bytes(db: &fontdb::Database, family: &str) -> Option<Vec<u8>> {
         stretch: fontdb::Stretch::Normal,
         style: fontdb::Style::Normal,
     })?;
-    db.with_face_data(id, |data, _| data.to_vec())
+    db.with_face_data(id, |data, index| FontData { font: Cow::Owned(data.to_vec()), index, tweak: screen_font_tweak() })
 }
 
 #[cfg(test)]

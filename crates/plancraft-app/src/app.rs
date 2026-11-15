@@ -2370,6 +2370,19 @@ impl eframe::App for PlanCraftApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.font_loaded {
+            if let Some(path) = std::env::var_os("PLANCRAFT_RENDER_DIAGNOSTICS") {
+                let details = serde_json::json!({
+                    "native_pixels_per_point": ctx.native_pixels_per_point(),
+                    "zoom_factor": ctx.zoom_factor(),
+                    "pixels_per_point": ctx.pixels_per_point(),
+                    "tessellation": format!("{:?}", ctx.tessellation_options(|o| *o)),
+                    "text_options": format!("{:?}", ui.style().visuals.text_options),
+                    "font_family": self.settings.font_family,
+                });
+                if let Ok(bytes) = serde_json::to_vec_pretty(&details) {
+                    let _ = plancraft_core::io::write_atomic(std::path::Path::new(&path), &bytes, plancraft_core::io::Privacy::OwnerOnly);
+                }
+            }
             crate::fonts::install(&ctx, &self.settings.font_family);
             self.font_loaded = true;
         }
